@@ -53,7 +53,7 @@ class NotesDB(utils.SubjectMixin):
         # now read all .json files from disk
         fnlist = glob.glob(self.helper_key_to_fname('*'))
         txtlist = glob.glob(unicode(self.config.txt_path + '/*.txt', 'utf-8'))
-        txtlist += glob.glob(unicode(self.config.txt_path + '/*.mkdn', 'utf-8'))
+        txtlist += glob.glob(unicode(self.config.txt_path + '/*.md', 'utf-8'))
 
         # removing json files and force full full sync if using text files
         # and none exists and json files are there
@@ -833,7 +833,23 @@ class NotesDB(utils.SubjectMixin):
 
             n['modifydate'] = time.time()
             self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
-
+    
+    def set_note_markdown(self, key, markdown):
+        n = self.notes[key]
+        old_markdown = utils.note_markdown(n);
+        if markdown != old_markdown:
+            if 'systemtags' not in n:
+                n['systemtags'] = []
+            
+            systemtags = n['systemtags']
+            
+            if markdown:
+        	    systemtags.append('markdown')       	
+            else:
+        	    systemtags.remove('markdown')
+            
+            n['modifydate'] = time.time()
+            self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
 
     def worker_save(self):
         while True:

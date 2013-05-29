@@ -10,6 +10,7 @@ import urllib2
 
 # first line with non-whitespace should be the title
 note_title_re = re.compile('\s*(.*)\n?')
+note_title_md_re = re.compile('^#\s*(.*)\n?')
         
 def generate_random_key():
     """Generate random 30 digit (15 byte) hex string.
@@ -20,10 +21,15 @@ def generate_random_key():
 
 def get_note_title(note):
     mo = note_title_re.match(note.get('content', ''))
+    title = ''
     if mo:
-        return mo.groups()[0]
-    else:
-        return ''
+        title =  mo.groups()[0]
+    
+    mo2 = note_title_md_re.match(title)
+    if mo2:
+    	title = mo2.groups()[0]
+    
+    return title
 
 def get_note_title_file(note):
     mo = note_title_re.match(note.get('content', ''))
@@ -40,7 +46,7 @@ def get_note_title_file(note):
             fn = unicode(fn)
 
         if note_markdown(note):
-            fn += '.mkdn'
+            fn += '.md'
         else:
             fn += '.txt'
 
@@ -98,6 +104,7 @@ def note_markdown(n):
         return 1
     else:
         return 0
+
 
 tags_illegal_chars = re.compile(r'[\s]')
 def sanitise_tags(tags):

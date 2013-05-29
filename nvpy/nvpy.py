@@ -268,6 +268,7 @@ class Controller:
         self.view.add_observer('change:text', self.observer_view_change_text)
         self.view.add_observer('change:tags', self.observer_view_change_tags)
         self.view.add_observer('change:pinned', self.observer_view_change_pinned)
+        self.view.add_observer('change:markdown', self.observer_view_change_markdown)
         self.view.add_observer('create:note', self.observer_view_create_note)
         self.view.add_observer('keep:house', self.observer_view_keep_house)
         self.view.add_observer('command:markdown',
@@ -602,6 +603,11 @@ class Controller:
         if self.selected_note_idx >= 0:
             key = self.notes_list_model.list[self.selected_note_idx].key
             self.notes_db.set_note_pinned(key, evt.value)
+    
+    def observer_view_change_markdown(self, view, evt_type, evt):
+        if self.selected_note_idx >= 0:
+            key = self.notes_list_model.list[self.selected_note_idx].key
+            self.notes_db.set_note_markdown(key, evt.value)
 
     def observer_view_close(self, view, evt_type, evt):
         # check that everything has been saved and synced before exiting

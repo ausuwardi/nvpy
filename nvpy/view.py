@@ -271,6 +271,7 @@ class NotesList(tk.Frame):
         tags = note.get('tags')
         modifydate = float(note.get('modifydate'))
         pinned = utils.note_pinned(note)
+        markdown = utils.note_markdown(note)
         self.note_headers.append((title, tags, modifydate, pinned))
 
         self.enable_text()
@@ -640,6 +641,7 @@ class View(utils.SubjectMixin):
         self.text_note.config(state=state)
         self.tags_entry.config(state=state)
         self.pinned_checkbutton.config(state=state)
+        self.markdown_checkbutton.config(state=state)
 
     def get_continuous_rendering(self):
         return self.continuous_rendering.get()
@@ -773,6 +775,7 @@ class View(utils.SubjectMixin):
         self.tags_entry.bind("<Escape>", lambda e: self.text_note.focus())
 
         self.pinned_checkbutton_var.trace('w', self.handler_pinned_checkbutton)
+        self.markdown_checkbutton_var.trace('w', self.handler_markdown_checkbutton)
 
         self.root.after(self.config.housekeeping_interval_ms, self.handler_housekeeper)
 
@@ -1010,6 +1013,12 @@ class View(utils.SubjectMixin):
         self.pinned_checkbutton_var = tk.IntVar()
         self.pinned_checkbutton = tk.Checkbutton(note_meta_frame, variable=self.pinned_checkbutton_var)
         self.pinned_checkbutton.pack(side=tk.LEFT)
+        
+        markdown_label = tk.Label(note_meta_frame,text="Markdown")
+        markdown_label.pack(side=tk.LEFT)
+        self.markdown_checkbutton_var = tk.IntVar()
+        self.markdown_checkbutton = tk.Checkbutton(note_meta_frame, variable=self.markdown_checkbutton_var)
+        self.markdown_checkbutton.pack(side=tk.LEFT)
 
         tags_label = tk.Label(note_meta_frame, text="Tags")
         tags_label.pack(side=tk.LEFT)
@@ -1196,7 +1205,7 @@ class View(utils.SubjectMixin):
                 logging.debug('pinned "%s" resync' % (nt,))
                 refresh_notes_list = True
                 break
-
+            
             tags = o.note.get('tags', 0)
             old_tags = self.notes_list.get_tags(i)
             if tags != old_tags:
@@ -1237,6 +1246,10 @@ class View(utils.SubjectMixin):
     def handler_pinned_checkbutton(self, *args):
         self.notify_observers('change:pinned',
             utils.KeyValueObject(value=self.pinned_checkbutton_var.get()))
+    
+    def handler_markdown_checkbutton(self, *args):
+    	self.notify_observers('change:markdown',
+    	    utils.KeyValueObject(value=self.markdown_checkbutton_var.get()))
 
     def handler_search_enter(self, evt):
         # user has pressed enter whilst searching
@@ -1410,6 +1423,7 @@ class View(utils.SubjectMixin):
         self.mute('change:text')
         self.mute('change:tags')
         self.mute('change:pinned')
+        self.mute('change:markdown')
 
 
     def set_cs(self, cs, silent=False):
@@ -1461,6 +1475,7 @@ class View(utils.SubjectMixin):
             tags=note.get('tags', [])
             self.tags_entry_var.set(','.join(tags))
             self.pinned_checkbutton_var.set(utils.note_pinned(note))
+            self.markdown_checkbutton_var.set(utils.note_markdown(note))
 
         if reset_undo:
             # usually when a new note is selected, we want to reset the
@@ -1509,6 +1524,7 @@ class View(utils.SubjectMixin):
         self.unmute('change:text')
         self.unmute('change:tags')
         self.unmute('change:pinned')
+        self.unmute('change:markdown')
 
 
     def update_selected_note_data(self, note):
