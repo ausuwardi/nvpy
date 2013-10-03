@@ -867,7 +867,7 @@ class View(utils.SubjectMixin):
         
         edit_menu.add_command(label="Find", accelerator="Ctrl+F",
                               underline=0, command=lambda: self.search_entry.focus())
-        self.root.bind_all("<Control-f>", lambda e: self.search_entry.focus())
+        self.root.bind_all("<Control-f>", self.search)
 
         # TOOLS ########################################################
         tools_menu = tk.Menu(menu, tearoff=False)
@@ -1425,6 +1425,9 @@ class View(utils.SubjectMixin):
         self.mute('change:pinned')
         self.mute('change:markdown')
 
+    def search(self,e):
+        self.search_entry.focus()
+        self.search_entry.selection_range(0,tk.END)
 
     def set_cs(self, cs, silent=False):
         if silent:
