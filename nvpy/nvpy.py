@@ -100,6 +100,7 @@ class Config:
                     # Filename or filepath to a css file used style the rendered
                     # output; e.g. nvpy.css or /path/to/my.css
                     'rest_css_path': None,
+                    'markdown_mode': '',
                    }
 
         cp = ConfigParser.SafeConfigParser(defaults)
@@ -152,6 +153,8 @@ class Config:
         self.background_color = cp.get(cfg_sec, 'background_color')
 
         self.rest_css_path = cp.get(cfg_sec, 'rest_css_path')
+
+        self.markdown_mode = cp.get(cfg_sec, 'markdown_mode')
 
 
 class NotesListModel(SubjectMixin):

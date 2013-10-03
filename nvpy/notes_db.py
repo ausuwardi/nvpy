@@ -182,6 +182,9 @@ class NotesDB(utils.SubjectMixin):
                     'syncdate' : 0, # never been synced with server
                     'tags' : []
                     }
+
+        if self.config.markdown_mode == '1':
+            new_note['systemtags'] = ['markdown']
         
         self.notes[new_key] = new_note
         
