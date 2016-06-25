@@ -1571,8 +1571,8 @@ class View(utils.SubjectMixin):
             tag_button.pack(side=tk.LEFT)
         
             #self.tags_entry_var.set(','.join(tags))
-            self.pinned_checkbutton_var.set(utils.note_pinned(note))
-            self.markdown_checkbutton_var.set(utils.note_markdown(note))
+        self.pinned_checkbutton_var.set(utils.note_pinned(note))
+        self.markdown_checkbutton_var.set(utils.note_markdown(note))
 
         if reset_undo:
             # usually when a new note is selected, we want to reset the
