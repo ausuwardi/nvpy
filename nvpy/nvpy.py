@@ -39,10 +39,14 @@ import argparse
 import os
 import sys
 import time
+import traceback
+import threading
+import re
 
 from utils import KeyValueObject, SubjectMixin
 import view
 import webbrowser
+from version import VERSION
 
 try:
     import markdown
@@ -50,6 +54,15 @@ except ImportError:
     HAVE_MARKDOWN = False
 else:
     HAVE_MARKDOWN = True
+    DEFAULT_MARKDOWN_EXTS = (
+        # Add 'fenced code block' syntax support.
+        # If you try to convert without this extension, code block is treated as inline code.
+        # https://python-markdown.github.io/extensions/fenced_code_blocks/
+        'markdown.extensions.fenced_code',
+        # Add table syntax support.
+        # https://python-markdown.github.io/extensions/tables/
+        'markdown.extensions.tables',
+    )
 
 try:
     import docutils
@@ -58,8 +71,6 @@ except ImportError:
     HAVE_DOCUTILS = False
 else:
     HAVE_DOCUTILS = True
-
-VERSION = "1.0.0 BETA"
 
 
 class Config:
@@ -80,6 +91,7 @@ class Config:
                     'appdir': app_dir,
                     'home': home,
                     'notes_as_txt': '0',
+                    'read_txt_extensions': 'txt,mkdn,md,mdown,markdown',
                     'housekeeping_interval': '2',
                     'search_mode': 'gstyle',
                     'case_sensitive': '1',
@@ -100,11 +112,17 @@ class Config:
                     'sn_username': '',
                     'sn_password': '',
                     'simplenote_sync': '1',
+                    'background_full_sync': 'true',
                     'debug': '1',
                     # Filename or filepath to a css file used style the rendered
                     # output; e.g. nvpy.css or /path/to/my.css
                     'rest_css_path': None,
                     'markdown_mode': '',
+                    'md_css_path': None,
+                    'md_extensions': '',
+                    'keep_search_keyword': 'false',
+                    'confirm_delete': 'true',
+                    'confirm_exit': 'false',
                    }
 
         # parse command-line arguments
@@ -141,10 +159,12 @@ class Config:
         self.sn_username = cp.get(cfg_sec, 'sn_username', raw=True)
         self.sn_password = cp.get(cfg_sec, 'sn_password', raw=True)
         self.simplenote_sync = cp.getint(cfg_sec, 'simplenote_sync')
+        self.background_full_sync = cp.get(cfg_sec, 'background_full_sync')
         # make logic to find in $HOME if not set
         self.db_path = cp.get(cfg_sec, 'db_path')
         #  0 = alpha sort, 1 = last modified first
         self.notes_as_txt = cp.getint(cfg_sec, 'notes_as_txt')
+        self.read_txt_extensions = cp.get(cfg_sec, 'read_txt_extensions')
         self.txt_path = os.path.join(home, cp.get(cfg_sec, 'txt_path'))
         self.search_mode = cp.get(cfg_sec, 'search_mode')
         self.case_sensitive = cp.getint(cfg_sec, 'case_sensitive')
@@ -168,7 +188,13 @@ class Config:
         self.background_color = cp.get(cfg_sec, 'background_color')
 
         self.rest_css_path = cp.get(cfg_sec, 'rest_css_path')
+        self.markdown_mode = cp.get(cfg_sec, 'markdown_mode')
+        self.md_css_path = cp.get(cfg_sec, 'md_css_path')
+        self.md_extensions = cp.get(cfg_sec, 'md_extensions')
         self.debug = cp.getint(cfg_sec, 'debug')
+        self.keep_search_keyword = cp.getboolean(cfg_sec, 'keep_search_keyword')
+        self.confirm_delete = cp.getboolean(cfg_sec, 'confirm_delete')
+        self.confirm_exit = cp.getboolean(cfg_sec, 'confirm_exit')
 
     def parse_cmd_line_opts(self):
         if __name__ != '__main__':
@@ -208,12 +234,21 @@ class NotesListModel(SubjectMixin):
         else:
             return -1
 
+    def get(self, key):
+        idx = self.get_idx(key)
+        if idx < 0:
+            raise KeyError('Note is not found: key={}'.format(key))
+
+        return self.list[idx]
+
 
 class Controller:
     """Main application class.
     """
 
     def __init__(self, config):
+        SubjectMixin.MAIN_THREAD = threading.current_thread()
+
         # should probably also look in $HOME
         self.config = config
         self.config.app_version = VERSION
@@ -243,16 +278,28 @@ class Controller:
         if self.config.sn_username == '':
             self.config.simplenote_sync = 0
 
-        css = self.config.rest_css_path
-        if css:
-            if css.startswith("~/"):
+        rst_css = self.config.rest_css_path
+        if rst_css:
+            if rst_css.startswith("~/"):
                 # On Mac, paths that start with '~/' aren't found by path.exists
-                css = css.replace(
+                rst_css = rst_css.replace(
                     "~", os.path.abspath(os.path.expanduser('~')), 1)
-                self.config.rest_css_path = css
-            if not os.path.exists(css):
+                self.config.rest_css_path = rst_css
+            if not os.path.exists(rst_css):
                 # Couldn't find the user-defined css file. Use docutils css instead.
                 self.config.rest_css_path = None
+        md_css = self.config.md_css_path
+        if md_css:
+            if md_css.startswith("~/"):
+                # On Mac, paths that start with '~/' aren't found by path.exists
+                md_css = md_css.replace(
+                    "~", os.path.abspath(os.path.expanduser('~')), 1)
+                self.config.md_css_path = md_css
+            if not os.path.exists(md_css):
+                # Couldn't find the user-defined css file.
+                # Do not use css styling for markdown.
+                self.config.md_css_path = None
+
 
         self.notes_list_model = NotesListModel()
         # create the interface
@@ -273,7 +320,8 @@ class Controller:
 
         if self.config.simplenote_sync:
             self.notes_db.add_observer('progress:sync_full', self.observer_notes_db_sync_full)
-            self.sync_full()
+            self.notes_db.add_observer('error:sync_full', self.observer_notes_db_error_sync_full)
+            self.notes_db.add_observer('complete:sync_full', self.observer_notes_db_complete_sync_full)
 
         # we want to be notified when the user does stuff
         self.view.add_observer('click:notelink',
@@ -313,14 +361,11 @@ class Controller:
 
         # we'll use this to keep track of the currently selected note
         # we only use idx, because key could change from right under us.
-        self.selected_note_idx = -1
+        self.selected_note_key = None
         self.view.select_note(0)
 
-    def get_selected_note_key(self):
-        if self.selected_note_idx >= 0:
-            return self.notes_list_model.list[self.selected_note_idx].key
-        else:
-            return None
+        if self.config.background_full_sync:
+            self.view.after(0, self.sync_full)
 
     def main_loop(self):
         if not self.config.files_read:
@@ -333,10 +378,15 @@ class Controller:
             (str(self.config.files_read),)
             self.view.show_warning('Rename config section', wmsg)
 
+        def poll_notifies():
+            self.view.after(100, poll_notifies)
+            self.notes_db.handle_notifies()
+
+        self.view.after(0, poll_notifies)
         self.view.main_loop()
 
     def observer_notes_db_change_note_status(self, notes_db, evt_type, evt):
-        skey = self.get_selected_note_key()
+        skey = self.selected_note_key
         if skey == evt.key:
             self.view.set_note_status(self.notes_db.get_note_status(skey))
 
@@ -344,22 +394,59 @@ class Controller:
         logging.debug(evt.msg)
         self.view.set_status_text(evt.msg)
 
+        # regenerate display list
+        # reselect old selection
+        # put cursor where it used to be.
+        self.view.refresh_notes_list()
+
+        # change status to "Full syncing"
+        self.update_note_status()
+
+    def observer_notes_db_error_sync_full(self, notes_db, evt_type, evt):
+        try:
+            raise evt.error
+        except SyncError, e:
+            self.view.show_error('Sync error', e)
+        except WriteError, e:
+            emsg = "Please check nvpy.log.\n" + str(e)
+            self.view.show_error('Sync error', emsg)
+            exit(1)
+        except Exception, e:
+            crash_log = ''.join(traceback.format_exception(*evt.exc_info))
+            logging.error(crash_log)
+            emsg = 'An unexpected error has occurred.\n'\
+                   'Please check nvpy.log.\n' \
+                   + repr(e)
+            self.view.show_error('Sync error', emsg)
+            exit(1)
+
+        # return normal status from "Full syning".
+        self.update_note_status()
+
+    def observer_notes_db_complete_sync_full(self, notes_db, evt_type, evt):
+        sync_from_server_errors = evt.errors
+        if sync_from_server_errors > 0:
+            self.view.show_error('Error syncing notes from server', 'Error syncing %d notes from server. Please check nvpy.log for details.' % (sync_from_server_errors,))
+
+        # return normal status from "Full syning".
+        self.update_note_status()
+
     def observer_notes_db_synced_note(self, notes_db, evt_type, evt):
         """This observer gets called only when a note returns from
         a sync that's more recent than our most recent mod to that note.
         """
 
-        selected_note_o = self.notes_list_model.list[self.selected_note_idx]
         # if the note synced back matches our currently selected note,
         # we overwrite.
-
-        if selected_note_o.key == evt.lkey:
+        if self.selected_note_key is not None and self.selected_note_key == evt.lkey:
+            selected_note_o = self.notes_list_model.get(self.selected_note_key)
             if selected_note_o.note['content'] != evt.old_note['content']:
                 self.view.mute_note_data_changes()
                 # in this case, we want to keep the user's undo buffer so that they
                 # can undo synced back changes if they would want to.
                 self.view.set_note_data(selected_note_o.note, reset_undo=False)
                 self.view.unmute_note_data_changes()
+        self.view.refresh_notes_list()
 
     def observer_view_click_notelink(self, view, evt_type, note_name):
         # find note_name in titles, try to jump to that note
@@ -378,11 +465,8 @@ class Controller:
         # delete note from notes_db
         # remove the note from the notes_list_model.list
 
-        # if these two are not equal, something is not kosher.
-        assert(evt.sel == self.selected_note_idx)
-
         # first get key of note that is to be deleted
-        key = self.get_selected_note_key()
+        key = self.selected_note_key
 
         # then try to select after the one that is to be deleted
         nidx = evt.sel + 1
@@ -398,14 +482,24 @@ class Controller:
         self.view.set_search_entry_text(self.view.get_search_entry_text())
 
     def helper_markdown_to_html(self):
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
+        if self.selected_note_key:
+            key = self.selected_note_key
             c = self.notes_db.get_note_content(key)
             logging.debug("Trying to convert %s to html." % (key,))
             if HAVE_MARKDOWN:
                 logging.debug("Convert note %s to html." % (key,))
-                html = markdown.markdown(c)
+                exts = re.split("\\s", self.config.md_extensions.strip()) if self.config.md_extensions else []
+                exts += list(DEFAULT_MARKDOWN_EXTS)
+                # remove duplicate items on exts.
+                exts = list(set(exts))
+
+                html = markdown.markdown(c, extensions=exts)
                 logging.debug("Convert done.")
+                if self.config.md_css_path:
+                    css = u"""<link rel="stylesheet" href="%s">""" % (self.config.md_css_path,)
+                    html = u"""<div class="markdown-body">%s</div>""" % (html,)
+                else:
+                    css = u""""""
 
             else:
                 logging.debug("Markdown not installed.")
@@ -420,19 +514,22 @@ class Controller:
 <head>
 <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
 %s
+%s
 </head>
 <body>
 %s
 </body>
 </html>
-            """ % ('<meta http-equiv="refresh" content="5">' if self.view.get_continuous_rendering() else "",html,)
+            """ % ('<meta http-equiv="refresh" content="5">' if self.view.get_continuous_rendering() else "",
+                   css if self.config.md_css_path else "",
+                   html,)
             f.write(s)
             f.close()
             return fn
 
     def helper_rest_to_html(self):
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
+        if self.selected_note_key:
+            key = self.selected_note_key
             c = self.notes_db.get_note_content(key)
             if HAVE_DOCUTILS:
                 settings = {}
@@ -515,8 +612,8 @@ class Controller:
         self.select_note(evt.sel)
 
     def observer_view_sync_current_note(self, view, evt_type, evt):
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
+        if self.selected_note_key:
+            key = self.selected_note_key
             # this call will update our in-memory version if necessary
             ret = self.notes_db.sync_note_unthreaded(key)
             if ret and ret[1] == True:
@@ -547,7 +644,7 @@ class Controller:
 
     def observer_view_change_entry(self, view, evt_type, evt):
         # store the currently selected note key
-        k = self.get_selected_note_key()
+        k = self.selected_note_key
         # for each new evt.value coming in, get a new list from the notes_db
         # and set it in the notes_list_model
         nn, match_regexp, active_notes = self.notes_db.filter_notes(evt.value)
@@ -571,8 +668,6 @@ class Controller:
             # if it does turn out to be new note content, this will be handled
             # a few lines down.
             self.view.select_note(idx, silent=True)
-            # but of course we DO have to record the possibly new IDX!!
-            self.selected_note_idx = idx
 
             # see if the note has been updated (content, tags, pin)
             new_note = self.notes_db.get_note(k)
@@ -595,41 +690,32 @@ class Controller:
     def observer_view_change_text(self, view, evt_type, evt):
         # get new text and update our database
         # need local key of currently selected note for this
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
-            self.notes_db.set_note_content(key,
-                                           self.view.get_text())
+        if self.selected_note_key:
+            self.notes_db.set_note_content(self.selected_note_key, self.view.get_text())
 
     def observer_view_change_tags(self, view, evt_type, evt):
         # get new text and update our database
-        # need local key of currently selected note for this
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
-            self.notes_db.set_note_tags(key, evt.value)
+        if self.selected_note_key:
+            self.notes_db.set_note_tags(self.selected_note_key, evt.value)
             self.view.cmd_notes_list_select()
 
     def observer_view_delete_tag(self, view, evt_type, evt):
-        key = self.notes_list_model.list[self.selected_note_idx].key
-        self.notes_db.delete_note_tag(key, evt.tag)
+        self.notes_db.delete_note_tag(self.selected_note_key, evt.tag)
         self.view.cmd_notes_list_select()
-    
+
     def observer_view_add_tag(self, view, evt_type, evt):
-        key = self.notes_list_model.list[self.selected_note_idx].key
-        self.notes_db.add_note_tags(key, evt.tags)
+        self.notes_db.add_note_tags(self.selected_note_key, evt.tags)
         self.view.cmd_notes_list_select()
         self.view.tags_entry_var.set('')
 
     def observer_view_change_pinned(self, view, evt_type, evt):
         # get new text and update our database
-        # need local key of currently selected note for this
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
-            self.notes_db.set_note_pinned(key, evt.value)
+        if self.selected_note_key:
+            self.notes_db.set_note_pinned(self.selected_note_key, evt.value)
     
     def observer_view_change_markdown(self, view, evt_type, evt):
-        if self.selected_note_idx >= 0:
-            key = self.notes_list_model.list[self.selected_note_idx].key
-            self.notes_db.set_note_markdown(key, evt.value)
+		if self.selected_note_key:
+			self.notes_db.set_note_markdown(self.selected_note_key, evt.value)
 
     def observer_view_close(self, view, evt_type, evt):
         # check that everything has been saved and synced before exiting
@@ -655,13 +741,21 @@ class Controller:
                 self.view.close()
 
         else:
+            if self.config.confirm_exit:
+                msg = "Do you want to exit?"
+                if not self.view.askyesno('Confirm exit', msg):
+                    return
+
             self.view.close()
 
     def observer_view_create_note(self, view, evt_type, evt):
         # create the note
         new_key = self.notes_db.create_note(evt.title)
         # clear the search entry, this should trigger a new list being returned
-        self.view.set_search_entry_text('')
+        keyword = ''
+        if self.config.keep_search_keyword:
+            keyword = self.view.get_search_entry_text()
+        self.view.set_search_entry_text(keyword)
         # we should focus on our thingy
         idx = self.notes_list_model.get_idx(new_key)
         self.view.select_note(idx)
@@ -684,14 +778,13 @@ class Controller:
         else:
             key = None
             note = None
-            idx = -1
             # no note selected, so we clear the UI (and display a clear
             # message that no note is selected) and we disable note
             # editing controls.
             self.view.clear_note_ui()
             self.view.set_note_editing(False)
 
-        self.selected_note_idx = idx
+        self.selected_note_key = key
 
         # when we do this, we don't want the change:{text,tags,pinned} events
         # because those should only fire when they are changed through the UI
@@ -703,24 +796,14 @@ class Controller:
         self.view.unmute_note_data_changes()
 
     def sync_full(self):
-        try:
-            sync_from_server_errors = self.notes_db.sync_full()
-
-        except SyncError, e:
-            self.view.show_error('Sync error', e)
-        except WriteError, e:
-            emsg = "Please check nvpy.log.\n" + str(e)
-            self.view.show_error('Sync error', emsg)
-            exit(1)
-
+        if self.config.background_full_sync:
+            self.notes_db.sync_full_threaded()
         else:
-            # regenerate display list
-            # reselect old selection
-            # put cursor where it used to be.
-            self.view.refresh_notes_list()
+            self.notes_db.sync_full_unthreaded()
 
-            if sync_from_server_errors > 0:
-                self.view.show_error('Error syncing notes from server', 'Error syncing %d notes from server. Please check nvpy.log for details.' % (sync_from_server_errors,))
+    def update_note_status(self):
+        skey = self.selected_note_key
+        self.view.set_note_status(self.notes_db.get_note_status(skey))
 
 
 def main():

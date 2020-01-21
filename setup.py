@@ -1,6 +1,6 @@
 import os
 from setuptools import setup
-from nvpy import nvpy
+import nvpy
 
 # Utility function to read the README file.
 # Used for the long_description.  It's nice, because now 1) we have a top level
@@ -21,7 +21,7 @@ setup(
     packages=['nvpy'],
     long_description=read('README.rst'),
     # these are in reality not hard requirements of nvpy
-    install_requires=['Markdown', 'docutils'],
+    install_requires=['Markdown', 'docutils', 'simplenote>=2.0.0'],
     entry_points={
         'gui_scripts': ['nvpy = nvpy.nvpy:main']
     },
