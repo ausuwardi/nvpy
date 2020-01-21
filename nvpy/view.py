@@ -384,7 +384,8 @@ class NotesList(tk.Frame):
     TAGS_COL = 1
     MODIFYDATE_COL = 2
     PINNED_COL = 3
-    CREATEDATE_COL = 4
+    MARKDOWN_COL = 4
+    CREATEDATE_COL = 5
 
     def __init__(self, master, font_family, font_size, config):
         tk.Frame.__init__(self, master)
@@ -456,7 +457,7 @@ class NotesList(tk.Frame):
         pinned = utils.note_pinned(note)
         markdown = utils.note_markdown(note)
         createdate = float(note.get('createdate'))
-        self.note_headers.append((title, tags, modifydate, pinned, createdate))
+        self.note_headers.append((title, tags, modifydate, pinned, markdown, createdate))
 
         self.enable_text()
 
@@ -1377,7 +1378,7 @@ class View(utils.SubjectMixin):
         self.pinned_checkbutton = tk.Checkbutton(note_pinned_frame, variable=self.pinned_checkbutton_var)
         self.pinned_checkbutton.pack(side=tk.LEFT)
         
-        markdown_label = tk.Label(note_pinned_frame,text="Markdown")
+        markdown_label = tk.Label(note_pinned_frame, text="Markdown")
         markdown_label.pack(side=tk.LEFT)
         self.markdown_checkbutton_var = tk.IntVar()
         self.markdown_checkbutton = tk.Checkbutton(note_pinned_frame, variable=self.markdown_checkbutton_var)
@@ -1932,7 +1933,7 @@ class View(utils.SubjectMixin):
         if note is not None:
             self.pinned_checkbutton_var.set(utils.note_pinned(note))
             self.markdown_checkbutton_var.set(utils.note_markdown(note))
-
+        
         if reset_undo:
             # usually when a new note is selected, we want to reset the
             # undo buffer, so that a user can't undo right into the previously

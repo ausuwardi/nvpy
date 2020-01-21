@@ -13,7 +13,8 @@ from Queue import Queue, Empty as QueueEmpty
 # first line with non-whitespace should be the title
 note_title_re = re.compile('\s*(.*)\n?')
 note_title_md_re = re.compile('^#\s*(.*)\n?')
-        
+
+
 def generate_random_key():
     """Generate random 30 digit (15 byte) hex string.
 
