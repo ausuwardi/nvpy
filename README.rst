@@ -45,29 +45,7 @@ A note on automatic syncing
 Installation
 ============
 
-nvPY works best on Python 2.7.x. It does not work on Python 3.x yet.
-
-To install the latest development version from github, do::
-
-    pip install 'git+https://github.com/cpbotha/nvpy.git#egg=nvpy'
-
-OR, to install the version currently on pypi, do::
-
-    pip install nvpy
-    
-If already have nvpy installed, but you want to upgrade, try the following::
-
-    sudo pip uninstall nvpy
-    sudo pip install --upgrade nvpy
-
-OR, you can of course use easy\_install instead::
-
-    easy_install nvpy
-
-github always has the latest development version, whereas I upload
-tagged snapshots (v0.9 for example) to pypi.
-
-For more detailed installation recipes, also for beginners, and for instructions on how to integrate nvPY with your Linux desktop environment, see the `nvPY installation guide <https://github.com/cpbotha/nvpy/blob/master/docs/installation.rst>`_.
+See the `nvPY installation guide <https://github.com/cpbotha/nvpy/blob/master/docs/installation.rst>`_.
 
 How to run for the first time
 =============================
@@ -108,6 +86,48 @@ should work out of the box on Ubuntu installations.
 Let us know on the Google group if you have suggestions for further decreasing
 the level of ugliness!
 
+Theme Customization
+===================
+
+nvPY was prepared two themes.  You can apply it by editing `nvpy.cfg`.
+
+**Light Theme**: ::
+
+    # Colors (light theme)
+    text_color = black
+    selected_note_color = light blue
+    note_info_color = dark gray
+    highlight_note_info_color = light yellow
+    url_color = blue
+    background_color = white
+    highlight_background_color = yellow
+
+.. image:: ./images/light-theme.png
+
+**Dark Theme**: ::
+
+    # Colors (dark theme)
+    text_color = white
+    selected_note_color = #04a
+    note_info_color = light gray
+    highlight_note_info_color = #440
+    url_color = #08f
+    background_color = black
+    highlight_background_color = #440
+
+.. image:: ./images/dark-theme.png
+
+If you dont like it, it would be better to customize the theme as your like.
+Let's change some options based on the above theme.
+Options are accept 3 formats:
+
+* Hex triplet format (#rrggbb)
+* Shorthand hex triplet format (#rgb)
+* Color names  (See `color names list <https://www.tcl.tk/man/tcl8.5/TkCmd/colors.htm>`_ and `color chart <https://wiki.tcl.tk/37701>`_)
+
+Note: during customizing the theme we highly recommend setting ``simplenote_sync = 0`` to disable sync.
+Because prevent reach the API rate limit by automatic full synchronization at startup.
+
 Keyboard handling
 =================
 
@@ -131,26 +151,32 @@ on large note collections.
 
 Here's a summary of the different shortcut keys that you can use in nvPY:
 
-========== ==========
-Key combo  Action
-========== ==========
-Ctrl-?     Display these key-bindings.
-Ctrl-A     Select all text when in the note editor.
-Ctrl-D     Move note to trash. This can be easily recovered using the simplenote webapp.
-Ctrl-F     Start real-time incremental regular expression search. As you type, notes list is filtered. Up / down cursor keys go to previous / next note.
-Ctrl-G     Edit tags for currently selected note. Press ESC to return to note editing.
-Ctrl-M     Render Markdown note to HTML and open browser window.
-Ctrl-N     Create new note.
-Ctrl-Q     Exit nvPY.
-Ctrl-R     Render reStructuredText (reST) note to HTML and open browser window.
-Ctrl-S     Force sync of current note with simplenote server. Saving to disc and syncing to server also happen continuously in the background.
-Ctrl-Y     Redo note edits.
-Ctrl-Z     Undo note edits.
-Ctrl-SPACE In search box, autocomplete tag under cursor. Keep on pressing for more alternatives.
-Ctrl-+/-   Increase or decrease the font size.
-ESC        Go from edit mode to notes list.
-ENTER      Start editing currently selected note. If there's a search string but no notes in the list, ENTER creates a new note with that search string as its title.
-========== ==========
+============= ==========
+Key combo     Action
+============= ==========
+Ctrl-?        Display these key-bindings.
+Ctrl-A        Select all text when in the note editor.
+Ctrl-D        Move note to trash. This can be easily recovered using the simplenote webapp.
+Ctrl-F        Start real-time incremental regular expression search. As you type, notes list is filtered. Up / down cursor keys go to previous / next note.
+Ctrl-G        Edit tags for currently selected note. Press ESC to return to note editing.
+Ctrl-J        Navigate (down) to next note in list. (VIM binding)
+Ctrl-K        Navigate (up) to previous note in list. (VIM binding)
+Ctrl-M        Render Markdown note to HTML and open browser window.
+Ctrl-N        Create new note.
+Ctrl-Q        Exit nvPY.
+Ctrl-R        Render reStructuredText (reST) note to HTML and open browser window.
+Ctrl-S        Force sync of current note with simplenote server. Saving to disc and syncing to server also happen continuously in the background.
+Ctrl-Shift-S  Toggle a pinned button.
+Ctrl-Y        Redo note edits.
+Ctrl-Z        Undo note edits.
+Ctrl-SPACE    In search box, autocomplete tag under cursor. Keep on pressing for more alternatives.
+Ctrl-+/-      Increase or decrease the font size.
+Ctrl-BS       Delete previous word in the note editor.
+Ctrl-Delete   Delete next word in the note editor.
+ESC           Go from edit mode to notes list.
+Ctrl-[        Same as ESC. (VIM binding)
+ENTER         Start editing currently selected note. If there's a search string but no notes in the list, ENTER creates a new note with that search string as its title.
+============= ==========
 
 Features
 ========
@@ -179,7 +205,6 @@ Features
 Planned features
 ================
 
-* Port to Python 3.
 * sqlite storage backend.
 * Full(ish) screen mode.
 * Prettiness.
@@ -210,4 +235,8 @@ Credits
 Running Tests
 =============
 
-PYTHONPATH=.:$PYTHONPATH python -m unittest discover -s tests -p '*.py'
+Run the following command. ::
+
+    make test
+
+NOTE: While test cases are running, the nvpy window is displayed many times.  It will impede your work.
