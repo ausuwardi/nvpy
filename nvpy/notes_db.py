@@ -1,34 +1,70 @@
 # nvPY: cross-platform note-taking app with simplenote syncing
 # copyright 2012 by Charl P. Botha <cpbotha@vxlabs.com>
 # new BSD license
-
+import sys
 import codecs
 import copy
 import glob
 import os
-import sys
 import json
 import logging
-from Queue import Queue, Empty
+import enum
+import abc
+import unicodedata
+from queue import Queue, Empty
+from http.client import HTTPException
+from .p3port import unicode
+from threading import Thread, Lock
+import time
+import typing
 import re
 import base64
-import collections
-import simplenote
-from simplenote import Simplenote
+import simplenote  # type:ignore
+from . import events
+from . import utils
+from .debug import wrap_buggy_function
+
+FilterResult = typing.Tuple[typing.List['NoteInfo'], str, int]
 
 # API key provided for nvPY.
 # Please do not use for other software!
-simplenote.simplenote.API_KEY = ''.join(reversed(base64.b64decode('OTg0OTI4ZTg4YjY0NzMyOTZjYzQzY2IwMDI1OWFkMzg=')))
+simplenote.simplenote.API_KEY = bytes(reversed(base64.b64decode('OTg0OTI4ZTg4YjY0NzMyOTZjYzQzY2IwMDI1OWFkMzg=')))
 
-from threading import Thread, Lock
-import time
-import utils
+
+# workaround for https://github.com/cpbotha/nvpy/issues/191
+class Simplenote(simplenote.Simplenote):
+    def get_token(self):
+        if self.token is None:
+            self.token = self.authenticate(self.username, self.password)
+            if self.token is None:
+                raise HTTPException('failed to connect to the server')
+        try:
+            return str(self.token, 'utf-8')
+        except TypeError:
+            return self.token
+
+    def get_note(self, *args, **kwargs):
+        try:
+            return super().get_note(*args, **kwargs)
+        except HTTPException as e:
+            return e, -1
+
+    def update_note(self, *args, **kwargs):
+        try:
+            return super().update_note(*args, **kwargs)
+        except HTTPException as e:
+            return e, -1
+
+    def get_note_list(self, *args, **kwargs):
+        try:
+            return super().get_note_list(*args, **kwargs)
+        except HTTPException as e:
+            return e, -1
+
 
 ACTION_SAVE = 0
 ACTION_SYNC_PARTIAL_TO_SERVER = 1
 ACTION_SYNC_PARTIAL_FROM_SERVER = 2  # UNUSED.
-
-from .debug import wrap_buggy_function
 
 
 class SyncError(RuntimeError):
@@ -43,11 +79,215 @@ class WriteError(RuntimeError):
     pass
 
 
-UpdateResult = collections.namedtuple('UpdateResult', (
-    'note',
-    'is_updated',
-    'error_object',
-))
+class UpdateResult(typing.NamedTuple):
+    # Note object
+    note: typing.Any
+    is_updated: bool
+    # Usually, error_object is None.  When failed to update, it have an error object.
+    error_object: typing.Optional[typing.Any]
+
+
+class NoteStatus(typing.NamedTuple):
+    saved: bool
+    synced: bool
+    modified: bool
+    full_syncing: bool
+
+
+class NoteInfo(typing.NamedTuple):
+    key: str
+    note: typing.Any
+    tagfound: int
+
+
+class _BackgroundTask(typing.NamedTuple):
+    action: int
+    key: str
+    note: typing.Any
+
+
+class _BackgroundTaskReslt(typing.NamedTuple):
+    action: int
+    key: str
+    note: typing.Any
+    error: int
+
+
+class SortMode(enum.Enum):
+    # Sort in alphabetic order.
+    ALPHA = 0
+    # Sort by modification date.
+    MODIFICATION_DATE = 1
+    # Sort by creation date.
+    CREATION_DATE = 2
+    # Sort in alphanumeric order.
+    ALPHA_NUM = 3
+
+
+class Sorter(abc.ABC):
+    """ The abstract class to build extensible and flexible sorting logic.
+
+    Usage:
+        >>> sorter = MergedSorter(PinnedSorter(), AlphaSorter())
+        >>> notes.sort(key=sorter)
+    """
+    @abc.abstractmethod
+    def __call__(self, o: NoteInfo):
+        raise NotImplementedError()
+
+
+class NopSorter(Sorter):
+    """ Do nothing. The notes list retain original order. Use it to simplify complex sort logic. """
+    def __call__(self, o: NoteInfo):
+        return 0
+
+
+class MergedSorter(Sorter):
+    """ Merge multiple sorters into a sorter. It realize sorting notes by multiple keys. """
+    def __init__(self, *sorters: Sorter):
+        self.sorters = sorters
+
+    def __call__(self, o: NoteInfo):
+        return tuple(s(o) for s in self.sorters)
+
+
+class PinnedSorter(Sorter):
+    """ Sort that pinned notes are on top. """
+    def __call__(self, o: NoteInfo):
+        # Pinned notes on top.
+        return 0 if utils.note_pinned(o.note) else 1
+
+
+class AlphaSorter(Sorter):
+    """ Sort in alphabetically on note title. """
+    def __call__(self, o: NoteInfo):
+        return utils.get_note_title(o.note)
+
+
+T = typing.TypeVar('T')
+
+
+class AlphaNumSorter(Sorter):
+    """ Sort in alphanumeric order on note title. """
+    class Nullable(typing.Generic[T]):
+        """ Null-safe comparable object for any types.
+
+        Built-in types can not compare with None. For example, if you try to execute `1 < None`, it will raise a
+        TypeError. The Nullable solves this problem, and further simplifies of comparison logic.
+        """
+        @classmethod
+        def __class_getitem__(cls, item):
+            return typing.TypeAlias(AlphaNumSorter.Nullable)
+
+        def __init__(self, val):
+            self.val = val
+
+        def __eq__(self, other):
+            if not isinstance(other, AlphaNumSorter.Nullable):
+                return NotImplemented
+            return self.val == other.val
+
+        def __gt__(self, other):
+            if not isinstance(other, AlphaNumSorter.Nullable):
+                return NotImplemented
+            if self.val is None:
+                return False
+            else:
+                if other.val is None:
+                    return True
+                return self.val > other.val
+
+        def __repr__(self):
+            return f'Nullable({repr(self.val)})'
+
+    class Element(typing.NamedTuple):
+        digits: 'AlphaNumSorter.Nullable[int]'
+        letters: 'AlphaNumSorter.Nullable[str]'
+        other: 'AlphaNumSorter.Nullable[str]'
+
+    def _enumerate_chars_with_category(self, s: str):
+        for c in s:
+            category = unicodedata.category(c)
+            if category == 'Nd':
+                yield 'numeric', c
+            elif category[0] == 'N' or category[0] == 'L':
+                yield 'letter', c
+            else:
+                yield 'other', c
+
+    def _make_groups(self, iter_):
+        # 連続した同じグループをグループ化
+        s = ''
+        last_category = ''
+        for category, c in iter_:
+            if last_category == category:
+                s += c
+            elif last_category != '':
+                yield last_category, s
+                last_category = category
+                s = c
+            elif last_category == '':
+                last_category = category
+                s = c
+            else:
+                raise RuntimeError('bug')
+        yield last_category, s
+
+    def _str2elements(self, s: str):
+        if s == '':
+            # The _make_groups() will yield an empty string ('') if s is ''. This behavior causes a crash on this
+            # function. We should handle this case before executing _make_gropus().
+            return AlphaNumSorter.Element(
+                digits=AlphaNumSorter.Nullable(None),
+                letters=AlphaNumSorter.Nullable(None),
+                other=AlphaNumSorter.Nullable(None),
+            )
+        iter_ = self._enumerate_chars_with_category(s)
+        groups = self._make_groups(iter_)
+        for category, s in groups:
+            digits = None
+            letters = None
+            others = None
+            if category == 'numeric':
+                digits = int(s)
+            elif category == 'letter':
+                letters = s
+            elif category == 'other':
+                others = s
+            else:
+                raise RuntimeError('bug')
+            yield AlphaNumSorter.Element(
+                digits=AlphaNumSorter.Nullable(digits),
+                letters=AlphaNumSorter.Nullable(letters),
+                other=AlphaNumSorter.Nullable(others),
+            )
+
+    def __call__(self, o: NoteInfo):
+        title = utils.get_note_title(o.note)
+        return tuple(self._str2elements(title))
+
+
+class DateSorter(Sorter):
+    """ Sort in creation/modification date. """
+    def __init__(self, mode: SortMode):
+        if mode == SortMode.MODIFICATION_DATE:
+            self._sort_key = self._sort_key_modification_date
+        elif mode == SortMode.CREATION_DATE:
+            self._sort_key = self._sort_key_creation_date
+        else:
+            raise ValueError(f'invalid sort mode: {mode}')
+        self.mode = mode
+
+    def __call__(self, o: NoteInfo):
+        return self._sort_key(o.note)
+
+    def _sort_key_modification_date(self, note):
+        # Last modified on top
+        return -float(note.get('modifydate', 0))
+
+    def _sort_key_creation_date(self, note):
+        # Last modified on top
+        return -float(note.get('createdate', 0))
 
 
 class NotesDB(utils.SubjectMixin):
@@ -74,7 +314,7 @@ class NotesDB(utils.SubjectMixin):
         txtlist = []
 
         for ext in config.read_txt_extensions.split(','):
-            txtlist += glob.glob(unicode(self.config.txt_path + '/*.' + ext, 'utf-8'))
+            txtlist += glob.glob(self.config.txt_path + '/*.' + ext)
 
         # removing json files and force full full sync if using text files
         # and none exists and json files are there
@@ -90,22 +330,23 @@ class NotesDB(utils.SubjectMixin):
 
         for fn in fnlist:
             try:
-                n = json.load(open(fn, 'rb'))
+                with open(fn, 'rb') as f:
+                    n = json.load(f)
                 if self.config.notes_as_txt:
-                    nt = utils.get_note_title_file(n)
+                    nt = utils.get_note_title_file(n, self.config.replace_filename_spaces)
                     tfn = os.path.join(self.config.txt_path, nt)
                     if os.path.isfile(tfn):
                         self.titlelist[n.get('key')] = nt
                         txtlist.remove(tfn)
                         if os.path.getmtime(tfn) > os.path.getmtime(fn):
-                            logging.debug('Text note was changed: %s' % (fn,))
+                            logging.debug('Text note was changed: %s' % (fn, ))
                             with codecs.open(tfn, mode='rb', encoding='utf-8') as f:
                                 c = f.read()
 
                             n['content'] = c
                             n['modifydate'] = os.path.getmtime(tfn)
                     else:
-                        logging.debug('Deleting note : %s' % (fn,))
+                        logging.debug('Deleting note : %s' % (fn, ))
                         if not self.config.simplenote_sync:
                             os.unlink(fn)
                             continue
@@ -113,11 +354,11 @@ class NotesDB(utils.SubjectMixin):
                             n['deleted'] = 1
                             n['modifydate'] = now
 
-            except IOError, e:
+            except IOError as e:
                 logging.error('NotesDB_init: Error opening %s: %s' % (fn, str(e)))
                 raise ReadError('Error opening note file')
 
-            except ValueError, e:
+            except ValueError as e:
                 logging.error('NotesDB_init: Error reading %s: %s' % (fn, str(e)))
                 raise ReadError('Error reading note file')
 
@@ -132,17 +373,17 @@ class NotesDB(utils.SubjectMixin):
 
         if self.config.notes_as_txt:
             for fn in txtlist:
-                logging.debug('New text note found : %s' % (fn),)
+                logging.debug('New text note found : %s' % (fn, ))
                 tfn = os.path.join(self.config.txt_path, fn)
                 try:
                     with codecs.open(tfn, mode='rb', encoding='utf-8') as f:
                         c = f.read()
 
-                except IOError, e:
+                except IOError as e:
                     logging.error('NotesDB_init: Error opening %s: %s' % (fn, str(e)))
                     raise ReadError('Error opening note file')
 
-                except ValueError, e:
+                except ValueError as e:
                     logging.error('NotesDB_init: Error reading %s: %s' % (fn, str(e)))
                     raise ReadError('Error reading note file')
 
@@ -206,7 +447,7 @@ class NotesDB(utils.SubjectMixin):
             'syncdate': 0,  # never been synced with server
             'tags': []
         }
-        
+
         if self.config.markdown_mode == '1':
         	new_note['systemtags'] = ['markdown']
 
@@ -219,7 +460,7 @@ class NotesDB(utils.SubjectMixin):
         n['deleted'] = 1
         n['modifydate'] = time.time()
 
-    def filter_notes(self, search_string=None):
+    def filter_notes(self, search_string=None) -> FilterResult:
         """Return list of notes filtered with search string.
 
         Based on the search mode that has been selected in self.config,
@@ -239,27 +480,7 @@ class NotesDB(utils.SubjectMixin):
         else:
             filtered_notes, match_regexp, active_notes = self.filter_notes_gstyle(search_string)
 
-        if self.config.sort_mode == 0:
-            if self.config.pinned_ontop == 0:
-                # sort alphabetically on title
-                filtered_notes.sort(key=lambda o: utils.get_note_title(o.note))
-            else:
-                filtered_notes.sort(utils.sort_by_title_pinned)
-        elif self.config.sort_mode == 2:
-            if self.config.pinned_ontop == 0:
-                # last modified on top
-                filtered_notes.sort(key=lambda o: -float(o.note.get('createdate', 0)))
-            else:
-                filtered_notes.sort(utils.sort_by_create_date_pinned, reverse=True)
-
-
-        else:
-            if self.config.pinned_ontop == 0:
-                # last modified on top
-                filtered_notes.sort(key=lambda o: -float(o.note.get('modifydate', 0)))
-            else:
-                filtered_notes.sort(utils.sort_by_modify_date_pinned, reverse=True)
-
+        filtered_notes.sort(key=self.config.sorter)
         return filtered_notes, match_regexp, active_notes
 
     def _helper_gstyle_tagmatch(self, tag_pats, note):
@@ -316,8 +537,7 @@ class NotesDB(utils.SubjectMixin):
             # we found the first p that does not occur in content
             return False
 
-    def filter_notes_gstyle(self, search_string=None):
-
+    def filter_notes_gstyle(self, search_string=None) -> FilterResult:
         filtered_notes = []
         # total number of notes, excluding deleted
         active_notes = 0
@@ -327,9 +547,9 @@ class NotesDB(utils.SubjectMixin):
                 n = self.notes[k]
                 if not n.get('deleted'):
                     active_notes += 1
-                    filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=0))
+                    filtered_notes.append(NoteInfo(key=k, note=n, tagfound=0))
 
-            return filtered_notes, [], active_notes
+            return filtered_notes, '', active_notes
 
         # group0: ag - not used
         # group1: t(ag)?:([^\s]+)
@@ -339,7 +559,7 @@ class NotesDB(utils.SubjectMixin):
         # [('', 'tag1', '', ''), ('', 'tag2', '', ''), ('', '', '', 'word1'), ('', '', 'word2 word3', ''), ('ag', 'tag3', '', '')]
 
         groups = re.findall('t(ag)?:([^\s]+)|"([^"]+)"|([^\s]+)', search_string)
-        tms_pats = [[] for _ in range(3)]
+        tms_pats: typing.List[typing.List[str]] = [[] for _ in range(3)]
 
         # we end up with [[tag_pats],[multi_word_pats],[single_word_pats]]
         for gi in groups:
@@ -360,7 +580,9 @@ class NotesDB(utils.SubjectMixin):
 
                 tagmatch = self._helper_gstyle_tagmatch(tms_pats[0], n)
                 # case insensitive mode: WARNING - SLOW!
-                msword_pats = tms_pats[1] + tms_pats[2] if self.config.case_sensitive else [p.lower() for p in tms_pats[1] + tms_pats[2]]
+                msword_pats = tms_pats[1] + tms_pats[2] if self.config.case_sensitive else [
+                    p.lower() for p in tms_pats[1] + tms_pats[2]
+                ]
                 if tagmatch and self._helper_gstyle_mswordmatch(msword_pats, c):
                     # we have a note that can go through!
 
@@ -368,19 +590,21 @@ class NotesDB(utils.SubjectMixin):
                     # tagmatch == 2 if no tag was specced (so all notes go through)
                     tagfound = 1 if tagmatch == 1 else 0
                     # we have to store our local key also
-                    filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=tagfound))
+                    filtered_notes.append(NoteInfo(key=k, note=n, tagfound=tagfound))
 
-        return filtered_notes, '|'.join(tms_pats[1] + tms_pats[2]), active_notes
+        match_regexp = '|'.join(re.escape(p) for p in tms_pats[1] + tms_pats[2])
+        return filtered_notes, match_regexp, active_notes
 
-    def filter_notes_regexp(self, search_string=None):
+    def filter_notes_regexp(self, search_string=None) -> FilterResult:
         """Return list of notes filtered with search_string,
         a regular expression, each a tuple with (local_key, note).
         """
 
+        sspat: typing.Optional[typing.Pattern]
         if search_string:
             try:
                 if self.config.case_sensitive == 0:
-                    sspat = re.compile(search_string, re.MULTILINE|re.I)
+                    sspat = re.compile(search_string, re.MULTILINE | re.I)
                 else:
                     sspat = re.compile(search_string, re.MULTILINE)
             except re.error:
@@ -404,29 +628,21 @@ class NotesDB(utils.SubjectMixin):
             if self.config.search_tags == 1:
                 t = n.get('tags')
                 if sspat:
-                    # this used to use a filter(), but that would by definition
-                    # test all elements, whereas we can stop when the first
-                    # matching element is found
-                    # now I'm using this awesome trick by Alex Martelli on
-                    # http://stackoverflow.com/a/2748753/532513
-                    # first parameter of next is a generator
-                    # next() executes one step, but due to the if, this will
-                    # either be first matching element or None (second param)
-                    if t and next((ti for ti in t if sspat.search(ti)), None) is not None:
+                    if t and any(filter(lambda ti: sspat.search(ti), t)):  # type:ignore
                         # we have to store our local key also
-                        filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=1))
+                        filtered_notes.append(NoteInfo(key=k, note=n, tagfound=1))
 
                     elif sspat.search(c):
                         # we have to store our local key also
-                        filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=0))
+                        filtered_notes.append(NoteInfo(key=k, note=n, tagfound=0))
 
                 else:
                     # we have to store our local key also
-                    filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=0))
+                    filtered_notes.append(NoteInfo(key=k, note=n, tagfound=0))
             else:
-                if (not sspat or sspat.search(c)):
+                if not sspat or sspat.search(c):
                     # we have to store our local key also
-                    filtered_notes.append(utils.KeyValueObject(key=k, note=n, tagfound=0))
+                    filtered_notes.append(NoteInfo(key=k, note=n, tagfound=0))
 
         match_regexp = search_string if sspat else ''
 
@@ -439,23 +655,21 @@ class NotesDB(utils.SubjectMixin):
         return self.notes[key].get('content')
 
     def get_note_status(self, key):
-        o = utils.KeyValueObject(saved=False, synced=False, modified=False, full_syncing=self.full_syncing)
-        if key is None:
-            return o
+        saved, synced, modified = False, False, False
+        if key is not None:
+            n = self.notes[key]
+            modifydate = float(n['modifydate'])
+            savedate = float(n['savedate'])
 
-        n = self.notes[key]
-        modifydate = float(n['modifydate'])
-        savedate = float(n['savedate'])
+            if savedate > modifydate:
+                saved = True
+            else:
+                modified = True
 
-        if savedate > modifydate:
-            o.saved = True
-        else:
-            o.modified = True
+            if float(n['syncdate']) > modifydate:
+                synced = True
 
-        if float(n['syncdate']) > modifydate:
-            o.synced = True
-
-        return o
+        return NoteStatus(saved=saved, synced=synced, modified=modified, full_syncing=self.full_syncing)
 
     def get_save_queue_len(self):
         return self.q_save.qsize()
@@ -464,7 +678,7 @@ class NotesDB(utils.SubjectMixin):
         return self.q_sync.qsize()
 
     def helper_key_to_fname(self, k):
-            return os.path.join(self.db_path, k) + '.json'
+        return os.path.join(self.db_path, k) + '.json'
 
     def helper_save_note(self, k, note):
         """Save a single note to disc.
@@ -472,7 +686,7 @@ class NotesDB(utils.SubjectMixin):
         """
 
         if self.config.notes_as_txt:
-            t = utils.get_note_title_file(note)
+            t = utils.get_note_title_file(note, self.config.replace_filename_spaces)
             if t and not note.get('deleted'):
                 if k in self.titlelist:
                     logging.debug('Writing note : %s %s' % (t, self.titlelist[k]))
@@ -497,11 +711,11 @@ class NotesDB(utils.SubjectMixin):
                             c = unicode(c)
 
                         f.write(c)
-                except IOError, e:
+                except IOError as e:
                     logging.error('NotesDB_save: Error opening %s: %s' % (fn, str(e)))
                     raise WriteError('Error opening note file')
 
-                except ValueError, e:
+                except ValueError as e:
                     logging.error('NotesDB_save: Error writing %s: %s' % (fn, str(e)))
                     raise WriteError('Error writing note file')
 
@@ -516,7 +730,7 @@ class NotesDB(utils.SubjectMixin):
             if os.path.isfile(fn):
                 os.unlink(fn)
         else:
-            json.dump(note, open(fn, 'wb'), indent=2)
+            json.dump(note, codecs.open(fn, 'wb', encoding='utf-8'), indent=2)
 
         # record that we saved this to disc.
         note['savedate'] = time.time()
@@ -577,7 +791,7 @@ class NotesDB(utils.SubjectMixin):
             if Note(n).need_save:
                 cn = copy.deepcopy(n)
                 # put it on my queue as a save
-                o = utils.KeyValueObject(action=ACTION_SAVE, key=k, note=cn)
+                o = _BackgroundTask(action=ACTION_SAVE, key=k, note=cn)
                 self.q_save.put(o)
 
         # in this same call, we process stuff that might have been put on the result queue
@@ -594,7 +808,8 @@ class NotesDB(utils.SubjectMixin):
                 # o (.action, .key, .note) is something that was written to disk
                 # we only record the savedate.
                 self.notes[o.key]['savedate'] = o.note['savedate']
-                self.notify_observers('change:note-status', utils.KeyValueObject(what='savedate', key=o.key))
+                self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='savedate', key=o.key))
+                self.notify_observers('saved:note', events.NoteSavedEvent(key=o.key))
                 nsaved += 1
 
         return nsaved
@@ -637,7 +852,7 @@ class NotesDB(utils.SubjectMixin):
                 # we store the timestamp when this copy was made as the syncdate
                 cn['syncdate'] = time.time()
                 # put it on my queue as a sync
-                o = utils.KeyValueObject(action=ACTION_SYNC_PARTIAL_TO_SERVER, key=k, note=cn)
+                o = _BackgroundTask(action=ACTION_SYNC_PARTIAL_TO_SERVER, key=k, note=cn)
                 self.q_sync.put(o)
 
         # in this same call, we read out the result queue
@@ -688,10 +903,11 @@ class NotesDB(utils.SubjectMixin):
                                 self.notes[okey][tk] = o.note[tk]
 
                         # notify anyone (probably nvPY) that this note has been changed
-                        self.notify_observers('synced:note', utils.KeyValueObject(lkey=okey, old_note=old_note))
+                        self.notify_observers('synced:note', events.NoteSyncedEvent(lkey=okey, old_note=old_note))
 
                         nsynced += 1
-                        self.notify_observers('change:note-status', utils.KeyValueObject(what='syncdate', key=okey))
+                        self.notify_observers('change:note-status',
+                                              events.NoteStatusChangedEvent(what='syncdate', key=okey))
 
                 # after having handled the note that just came back,
                 # we can take it from this blocker dict
@@ -700,15 +916,7 @@ class NotesDB(utils.SubjectMixin):
         return (nsynced, nerrored)
 
     def sync_full_threaded(self):
-        def wrapper():
-            try:
-                sync_from_server_errors = self.sync_full_unthreaded()
-                self.notify_observers('complete:sync_full', utils.KeyValueObject(errors=sync_from_server_errors))
-            except Exception, e:
-                self.notify_observers('error:sync_full', utils.KeyValueObject(error=e, exc_info=sys.exc_info()))
-                raise
-
-        thread_sync_full = Thread(target=wrap_buggy_function(wrapper))
+        thread_sync_full = Thread(target=self.sync_full_unthreaded)
         thread_sync_full.setDaemon(True)
         thread_sync_full.start()
 
@@ -726,7 +934,7 @@ class NotesDB(utils.SubjectMixin):
             local_deletes = {}
             now = time.time()
 
-            self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Starting full sync.'))
+            self.notify_observers('progress:sync_full', events.SyncProgressEvent(msg='Starting full sync.'))
             # 1. Synchronize notes when it has locally changed.
             #    In this phase, synchronized all notes from client to server.
             for ni, lk in enumerate(self.notes.keys()):
@@ -754,24 +962,35 @@ class NotesDB(utils.SubjectMixin):
                             # if lk was a different (purely local) key, should be deleted
                             local_deletes[lk] = True
 
-                        self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Synced modified note %d to server.' % (ni,)))
+                        self.notify_observers(
+                            'progress:sync_full',
+                            events.SyncProgressEvent(msg='Synced modified note %d to server.' % (ni, )))
 
                     else:
                         key = n.get('key') or lk
-                        raise SyncError("Sync step 1 error - Could not update note {0} to server: {1}".format(key, str(result.error_object)))
+                        msg = "Sync step 1 error - Could not update note {0} to server: {1}".format(
+                            key, str(result.error_object))
+                        logging.error(msg)
+                        raise SyncError(msg)
 
             # 2. Retrieves full note list from server.
             #    In phase 2 to 5, synchronized all notes from server to client.
-            self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Retrieving full note list from server, could take a while.'))
+            self.notify_observers(
+                'progress:sync_full',
+                events.SyncProgressEvent(msg='Retrieving full note list from server, could take a while.'))
             self.waiting_for_simplenote = True
-            nl = self.simplenote.get_note_list()
+            nl = self.simplenote.get_note_list(data=False)
             self.waiting_for_simplenote = False
             if nl[1] == 0:
                 nl = nl[0]
-                self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Retrieved full note list from server.'))
+                self.notify_observers('progress:sync_full',
+                                      events.SyncProgressEvent(msg='Retrieved full note list from server.'))
 
             else:
-                raise SyncError('Could not get note list from server.')
+                error = nl[0]
+                msg = 'Could not get note list from server: %s' % str(error)
+                logging.error(msg)
+                raise SyncError(msg)
 
             # 3. Delete local notes not included in full note list.
             server_keys = {}
@@ -779,20 +998,23 @@ class NotesDB(utils.SubjectMixin):
                 k = n.get('key')
                 server_keys[k] = True
 
-            for lk in self.notes.keys():
+            for lk in list(self.notes.keys()):
                 if lk not in server_keys:
                     if self.notes[lk]['syncdate'] == 0:
                         # This note MUST NOT delete because it was created during phase 1 or phase 2.
                         continue
 
                     if self.config.notes_as_txt:
-                        tfn = os.path.join(self.config.txt_path, utils.get_note_title_file(self.notes[lk]))
+                        tfn = os.path.join(
+                            self.config.txt_path,
+                            utils.get_note_title_file(self.notes[lk], self.config.replace_filename_spaces))
                         if os.path.isfile(tfn):
                             os.unlink(tfn)
                     del self.notes[lk]
                     local_deletes[lk] = True
 
-            self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Deleted note %d.' % (len(local_deletes))))
+            self.notify_observers('progress:sync_full',
+                                  events.SyncProgressEvent(msg='Deleted note %d.' % (len(local_deletes))))
 
             # 4. Update local notes.
             lennl = len(nl)
@@ -814,7 +1036,9 @@ class NotesDB(utils.SubjectMixin):
                             self.notes[k].update(n)
                             self.notes[k]['syncdate'] = now
                             self.helper_save_note(k, self.notes[k])
-                            self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Synced newer note %d (%d) from server.' % (ni, lennl)))
+                            self.notify_observers(
+                                'progress:sync_full',
+                                events.SyncProgressEvent(msg='Synced newer note %d (%d) from server.' % (ni, lennl)))
 
                         else:
                             logging.error('Error syncing newer note %s from server: %s' % (k, err))
@@ -835,7 +1059,9 @@ class NotesDB(utils.SubjectMixin):
                         self.notes[k]['savedate'] = 0  # never been written to disc
                         self.notes[k]['syncdate'] = now
                         self.helper_save_note(k, self.notes[k])
-                        self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Synced new note %d (%d) from server.' % (ni, lennl)))
+                        self.notify_observers(
+                            'progress:sync_full',
+                            events.SyncProgressEvent(msg='Synced new note %d (%d) from server.' % (ni, lennl)))
 
                     else:
                         logging.error('Error syncing new note %s from server: %s' % (k, err))
@@ -847,10 +1073,11 @@ class NotesDB(utils.SubjectMixin):
                 if os.path.exists(fn):
                     os.unlink(fn)
 
-            self.notify_observers('progress:sync_full', utils.KeyValueObject(msg='Full sync complete.'))
+            self.notify_observers('complete:sync_full', events.SyncCompletedEvent(errors=sync_from_server_errors))
 
-            self.full_syncing = False
-            return sync_from_server_errors
+        except Exception as e:
+            # Report an error to UI thread.
+            self.notify_observers('error:sync_full', events.SyncFailedEvent(error=e, exc_info=sys.exc_info()))
 
         finally:
             self.full_syncing = False
@@ -862,7 +1089,7 @@ class NotesDB(utils.SubjectMixin):
         if content != old_content:
             n['content'] = content
             n['modifydate'] = time.time()
-            self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
+            self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
 
     def set_note_tags(self, key, tags):
         n = self.notes[key]
@@ -871,7 +1098,7 @@ class NotesDB(utils.SubjectMixin):
         if tags != old_tags:
             n['tags'] = tags
             n['modifydate'] = time.time()
-            self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
+            self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
 
     def delete_note_tag(self, key, tag):
         note = self.notes[key]
@@ -879,16 +1106,15 @@ class NotesDB(utils.SubjectMixin):
         note_tags.remove(tag)
         note['tags'] = note_tags
         note['modifydate'] = time.time()
-        self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
+        self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
 
     def add_note_tags(self, key, comma_seperated_tags):
-        note = self.notes[key]
-        note_tags = note.get('tags')
         new_tags = utils.sanitise_tags(comma_seperated_tags)
-        note_tags.extend(new_tags)
-        note['tags'] = note_tags
+        note = self.notes[key]
+        tags_set = set(note.get('tags')) | set(new_tags)
+        note['tags'] = sorted(tags_set)
         note['modifydate'] = time.time()
-        self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
+        self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
 
     def set_note_pinned(self, key, pinned):
         n = self.notes[key]
@@ -907,24 +1133,24 @@ class NotesDB(utils.SubjectMixin):
                 systemtags.remove('pinned')
 
             n['modifydate'] = time.time()
-            self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
-    
+            self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
+
     def set_note_markdown(self, key, markdown):
         n = self.notes[key]
         old_markdown = utils.note_markdown(n);
         if markdown != old_markdown:
             if 'systemtags' not in n:
                 n['systemtags'] = []
-            
+
             systemtags = n['systemtags']
-            
+
             if markdown:
-        	    systemtags.append('markdown')       	
+        	    systemtags.append('markdown')
             else:
         	    systemtags.remove('markdown')
-            
+
             n['modifydate'] = time.time()
-            self.notify_observers('change:note-status', utils.KeyValueObject(what='modifydate', key=key))
+            self.notify_observers('change:note-status', events.NoteStatusChangedEvent(what='modifydate', key=key))
 
     def is_different_note(self, local_note, remote_note):
         # for keeping original data.
@@ -955,9 +1181,9 @@ class NotesDB(utils.SubjectMixin):
                 try:
                     self.helper_save_note(o.key, o.note)
 
-                except WriteError, e:
+                except WriteError as e:
                     logging.error('FATAL ERROR in access to file system')
-                    print "FATAL ERROR: Check the nvpy.log"
+                    print("FATAL ERROR: Check the nvpy.log")
                     os._exit(1)
 
                 else:
@@ -971,56 +1197,54 @@ class NotesDB(utils.SubjectMixin):
         self.syncing_lock.acquire()
 
         while True:
+            task: _BackgroundTask
             if self.q_sync.empty():
                 self.syncing_lock.release()
-                o = self.q_sync.get()
+                task = self.q_sync.get()
                 self.syncing_lock.acquire()
 
             else:
-                o = self.q_sync.get()
+                task = self.q_sync.get()
 
-            if o.key not in self.threaded_syncing_keys:
+            if task.key not in self.threaded_syncing_keys:
                 # this note was already synced by sync_full thread.
                 continue
 
-            if o.action == ACTION_SYNC_PARTIAL_TO_SERVER:
-                if 'key' in o.note:
-                    logging.debug('Updating note %s (local key %s) to server.' % (o.note['key'], o.key))
+            if task.action == ACTION_SYNC_PARTIAL_TO_SERVER:
+                local_note = task.note
+                if 'key' in local_note:
+                    logging.debug('Updating note %s (local key %s) to server.' % (local_note['key'], task.key))
                 else:
-                    logging.debug('Sending new note (local key %s) to server.' % (o.key,))
+                    logging.debug('Sending new note (local key %s) to server.' % (task.key, ))
 
-                result = self.update_note_to_server(o.note)
-
+                result = self.update_note_to_server(task.note)
                 if result.error_object is None:
                     if not result.is_updated:
-                        o.error = 0
-                        self.q_sync_res.put(o)
+                        res = _BackgroundTaskReslt(action=task.action, key=task.key, note=task.note, error=0)
+                        self.q_sync_res.put(res)
                         continue
 
-                    n = result.note
-
-                    if not n.get('content', None):
+                    remote_note = result.note
+                    if not remote_note.get('content', None):
                         # if note has not been changed, we don't get content back
                         # delete our own copy too.
-                        del o.note['content']
+                        del local_note['content']
 
                     # syncdate was set when the note was copied into our queue
                     # we rely on that to determine when a returned note should
                     # overwrite a note in the main list.
 
-                    # store the actual note back into o
+                    # store the actual note back into local_note
                     # in-place update of our existing note copy
-                    o.note.update(n)
+                    local_note.update(remote_note)
 
-                    # success!
-                    o.error = 0
-
-                    # and put it on the result queue
-                    self.q_sync_res.put(o)
+                    # put result on the queue
+                    res = _BackgroundTaskReslt(action=task.action, key=task.key, note=local_note, error=0)
+                    self.q_sync_res.put(res)
 
                 else:
-                    o.error = 1
-                    self.q_sync_res.put(o)
+                    res = _BackgroundTaskReslt(action=task.action, key=task.key, note=task.note, error=1)
+                    self.q_sync_res.put(res)
 
     def update_note_to_server(self, note):
         """Update the note to simplenote server.
@@ -1029,7 +1253,10 @@ class NotesDB(utils.SubjectMixin):
         """
 
         self.waiting_for_simplenote = True
-        o, err = self.simplenote.update_note(note)
+        # WORKAROUND: simplenote <=v2.1.2 modifies the note passed by argument. To prevent on-memory database
+        #             corruption, Copy the note object before it is passed to simplenote library.
+        # https://github.com/cpbotha/nvpy/issues/181#issuecomment-489543782
+        o, err = self.simplenote.update_note(note.copy())
         self.waiting_for_simplenote = False
 
         if err == 0:
@@ -1046,10 +1273,11 @@ class NotesDB(utils.SubjectMixin):
                 error_object=None,
             )
 
-        elif 'key' in note:
-            update_error = o
+        update_error = o
 
-            # note has already been saved on the simplenote server.
+        if 'key' in note:
+            # Note has already been saved on the simplenote server.
+            # Try to recover the update error.
             self.waiting_for_simplenote = True
             o, err = self.simplenote.get_note(note['key'])
             self.waiting_for_simplenote = False
@@ -1064,18 +1292,41 @@ class NotesDB(utils.SubjectMixin):
                     # this phenomenon is rarely occurs.
                     # if it occurs, housekeeper's is going to repeatedly update this note.
                     # regard updating error as success for prevent this problem.
-                    logging.info('Regard updating error (local key %s, error object %s) as success.' % (o.key, repr(update_error)))
+                    logging.info('Regard updating error (local key %s, error object %s) as success.' %
+                                 (o.key, repr(update_error)))
                     return UpdateResult(
                         note=local_note,
                         is_updated=False,
                         error_object=None,
                     )
 
-        return UpdateResult(
-            note=None,
-            is_updated=False,
-            error_object=o,
-        )
+                else:
+                    # Local note and remote note are different.  But failed to update.
+                    logging.error('Could not update note %s to server: %s, local=%s, remote=%s' %
+                                  (note['key'], update_error, local_note, remote_note))
+                    return UpdateResult(
+                        note=None,
+                        is_updated=False,
+                        error_object=update_error,
+                    )
+
+            else:
+                get_error = o
+                logging.error('Could not get/update note %s: update_error=%s, get_error=%s' %
+                              (note['key'], update_error, get_error))
+                return UpdateResult(
+                    note=None,
+                    is_updated=False,
+                    error_object={
+                        'update_error': update_error,
+                        'get_error': get_error
+                    },
+                )
+
+        # Failed to create new note.
+        assert err
+        assert 'key' not in note
+        return UpdateResult(note=None, is_updated=False, error_object=update_error)
 
 
 class Note(dict):
@@ -1094,5 +1345,7 @@ class Note(dict):
         return 'key' not in self or float(self['modifydate']) > float(self['syncdate'])
 
     def is_newer_than(self, other):
-        return float(self['modifydate']) > float(other['modifydate'])
-
+        try:
+            return float(self['modifydate']) > float(other['modifydate'])
+        except KeyError:
+            return self['version'] > other['version']

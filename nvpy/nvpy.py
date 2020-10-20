@@ -29,27 +29,30 @@
 #   b) syncing with simplenote
 
 # to check if we're online
-
+import sys
 import codecs
-import ConfigParser
+from configparser import ConfigParser
+from .p3port import unicode
 import logging
 from logging.handlers import RotatingFileHandler
-from notes_db import NotesDB, SyncError, ReadError, WriteError
+from .notes_db import NotesDB, SyncError, ReadError, WriteError, SortMode, MergedSorter, PinnedSorter, AlphaSorter, DateSorter, AlphaNumSorter
 import argparse
 import os
-import sys
-import time
 import traceback
 import threading
 import re
-
-from utils import KeyValueObject, SubjectMixin
-import view
+import typing
+from . import tk
+from .utils import SubjectMixin
+from . import view
 import webbrowser
-from version import VERSION
+from .version import VERSION
+from . import events
+from http.client import HTTPException
+import pathlib
 
 try:
-    import markdown
+    import markdown  # type:ignore
 except ImportError:
     HAVE_MARKDOWN = False
 else:
@@ -73,20 +76,45 @@ else:
     HAVE_DOCUTILS = True
 
 
+class ColorConfig(typing.NamedTuple):
+    # Text color.
+    text: str
+    # Background color of selected note.
+    selected_note: str
+    # Text color for note info (title, tags, updated date, etc).
+    note_info: str
+    # Text color for highlighted note info.
+    highlight_note_info: str
+    # Text color for URL.
+    url: str
+    # Background color for URL selection.
+    url_selection_background: str
+    # Background color.
+    background: str
+    # Background color of highlighted area.
+    highlight_background: str
+
+
 class Config:
     """
     @ivar files_read: list of config files that were parsed.
     @ivar ok: True if config files had a default section, False otherwise.
     """
-    def __init__(self, app_dir):
+    def __init__(self, app_dir: str, cfg: typing.Optional[str]):
         """
         @param app_dir: the directory containing nvpy.py
+        @param cfg: path to configuration file
         """
 
         self.app_dir = app_dir
         # cross-platform way of getting home dir!
         # http://stackoverflow.com/a/4028943/532513
         home = os.path.abspath(os.path.expanduser('~'))
+
+        # the file that we write user settings to, which is different
+        # from the configuration files
+        self.settings_file = os.path.join(home, '.nvpy_settings')
+
         defaults = {'app_dir': app_dir,
                     'appdir': app_dir,
                     'home': home,
@@ -100,49 +128,41 @@ class Config:
                     'pinned_ontop': '1',
                     'db_path': os.path.join(home, '.nvpy'),
                     'txt_path': os.path.join(home, '.nvpy/notes'),
+                    'replace_filename_spaces': '1',
                     'theme': 'default',
                     'font_family': 'Courier',  # monospaced on all platforms
                     'font_size': '10',
+                    'list_hide_time': '0',
+                    'list_hide_tags': '0',
                     'list_font_family': 'Helvetica',  # sans on all platforms
                     'list_font_family_fixed': 'Courier',  # monospace on all platforms
                     'list_font_size': '10',
                     'layout': 'horizontal',
                     'print_columns': '0',
+                    'text_color': 'black',
+                    'selected_note_color': 'light blue',
+                    'note_info_color': 'dark gray',
+                    'highlight_note_info_color': 'lightyellow',
+                    'url_color': '#03f',
+                    'url_selection_background_color': 'yellow',
                     'background_color': 'white',
+                    'highlight_background_color': 'yellow',
                     'sn_username': '',
                     'sn_password': '',
                     'simplenote_sync': '1',
-                    'background_full_sync': 'true',
                     'debug': '1',
                     # Filename or filepath to a css file used style the rendered
                     # output; e.g. nvpy.css or /path/to/my.css
-                    'rest_css_path': None,
+                    'rest_css_path': '',
                     'markdown_mode': '',
-                    'md_css_path': None,
+                    'md_css_path': '',
                     'md_extensions': '',
                     'keep_search_keyword': 'false',
                     'confirm_delete': 'true',
                     'confirm_exit': 'false',
                    }
 
-        # parse command-line arguments
-        args = self.parse_cmd_line_opts()
-
-        # later config files overwrite earlier files
-        # try a number of alternatives
-        cfg_files = [os.path.join(app_dir, 'nvpy.cfg'),
-                     os.path.join(home, 'nvpy.cfg'),
-                     os.path.join(home, '.nvpy.cfg'),
-                     os.path.join(home, '.nvpy'),
-                     os.path.join(home, '.nvpyrc')]
-
-        # user has specified either a specific path to a CFG file, or a
-        # path relative to the nvpy.py location. specific takes precedence.
-        if args is not None and args.cfg is not None:
-            cfg_files.extend([os.path.join(app_dir, args.cfg), args.cfg])
-
-        cp = ConfigParser.SafeConfigParser(defaults)
-        self.files_read = cp.read(cfg_files)
+        self.files_read, cp = self._load_cfg(defaults, cfg)
 
         cfg_sec = 'nvpy'
 
@@ -159,16 +179,16 @@ class Config:
         self.sn_username = cp.get(cfg_sec, 'sn_username', raw=True)
         self.sn_password = cp.get(cfg_sec, 'sn_password', raw=True)
         self.simplenote_sync = cp.getint(cfg_sec, 'simplenote_sync')
-        self.background_full_sync = cp.get(cfg_sec, 'background_full_sync')
         # make logic to find in $HOME if not set
         self.db_path = cp.get(cfg_sec, 'db_path')
-        #  0 = alpha sort, 1 = last modified first
         self.notes_as_txt = cp.getint(cfg_sec, 'notes_as_txt')
         self.read_txt_extensions = cp.get(cfg_sec, 'read_txt_extensions')
         self.txt_path = os.path.join(home, cp.get(cfg_sec, 'txt_path'))
+        self.replace_filename_spaces = cp.getint(cfg_sec, 'replace_filename_spaces')
         self.search_mode = cp.get(cfg_sec, 'search_mode')
         self.case_sensitive = cp.getint(cfg_sec, 'case_sensitive')
         self.search_tags = cp.getint(cfg_sec, 'search_tags')
+        # See notes_db.SortMode.
         self.sort_mode = cp.getint(cfg_sec, 'sort_mode')
         self.pinned_ontop = cp.getint(cfg_sec, 'pinned_ontop')
         self.housekeeping_interval = cp.getint(cfg_sec, 'housekeeping_interval')
@@ -182,10 +202,22 @@ class Config:
         self.list_font_family_fixed = cp.get(cfg_sec, 'list_font_family_fixed')
         self.list_font_size = cp.getint(cfg_sec, 'list_font_size')
 
+        self.list_hide_time = cp.getint(cfg_sec, 'list_hide_time')
+        self.list_hide_tags = cp.getint(cfg_sec, 'list_hide_tags')
+
         self.layout = cp.get(cfg_sec, 'layout')
         self.print_columns = cp.getint(cfg_sec, 'print_columns')
 
-        self.background_color = cp.get(cfg_sec, 'background_color')
+        self.colors = ColorConfig(
+            text=cp.get(cfg_sec, 'text_color'),
+            selected_note=cp.get(cfg_sec, 'selected_note_color'),
+            note_info=cp.get(cfg_sec, 'note_info_color'),
+            highlight_note_info=cp.get(cfg_sec, 'highlight_note_info_color'),
+            url=cp.get(cfg_sec, 'url_color'),
+            url_selection_background=cp.get(cfg_sec, 'url_selection_background_color'),
+            background=cp.get(cfg_sec, 'background_color'),
+            highlight_background=cp.get(cfg_sec, 'highlight_background_color'),
+        )
 
         self.rest_css_path = cp.get(cfg_sec, 'rest_css_path')
         self.markdown_mode = cp.get(cfg_sec, 'markdown_mode')
@@ -196,15 +228,102 @@ class Config:
         self.confirm_delete = cp.getboolean(cfg_sec, 'confirm_delete')
         self.confirm_exit = cp.getboolean(cfg_sec, 'confirm_exit')
 
-    def parse_cmd_line_opts(self):
-        if __name__ != '__main__':
-            return None
+        self.warnings = []
+        if cp.has_option(cfg_sec, 'background_full_sync'):
+            w = lambda: logging.warning('"background_full_sync" option is removed.')
+            self.warnings.append(w)
 
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--cfg', '-c', default='', dest='cfg',
-                            metavar='nvpy.cfg', help='path to config file')
-        args = parser.parse_args()
-        return args
+    def _load_cfg(self, defaults: dict, cfg: typing.Optional[str]) -> typing.Tuple[typing.List[str], ConfigParser]:
+        """ Load configuration files.
+        If cfg argument is specified, read only specified file. Otherwise, read configuration files from some locations.
+
+        Args:
+            defaults: Dict of default key values.
+            cfg: Path to config file (optional).
+
+        Returns:
+            Returns following elements.
+            1st element: List of config file paths.  It may be empty (list of zero length, not None).
+            2nd element: ConfigParser object.
+        """
+        cp = ConfigParser(defaults)
+        if cfg:
+            # Read either a specific path to a config file, or a path relative to the nvpy.py location. Other config
+            # files should not read.
+            cfg1 = pathlib.Path(cfg).absolute()
+            cfg2 = pathlib.Path(self.app_dir) / cfg
+            if cfg1.exists():
+                cfg_files = [cfg1]
+            elif cfg2.exists():
+                cfg_files = [cfg2]
+            else:
+                logging.error(f'Not found configuration file from {cfg1} or {cfg2}')
+                cfg_files = []
+        else:
+            # Later config files overwrite earlier files try a number of alternatives.
+            home = pathlib.Path.home()
+            cfg_files = [
+                pathlib.Path(self.app_dir) / 'nvpy.cfg',
+                home / 'nvpy.cfg',
+                home / '.nvpy.cfg',
+                home / '.nvpy',
+                home / '.nvpyrc',
+            ]
+        return cp.read(cfg_files), cp
+
+    @property
+    def sorter(self):
+        mode = SortMode(self.sort_mode)
+
+        sorters = []
+        if self.pinned_ontop:
+            sorters.append(PinnedSorter())
+
+        if mode == SortMode.ALPHA:
+            sorters.append(AlphaSorter())
+        elif mode in [SortMode.MODIFICATION_DATE, SortMode.CREATION_DATE]:
+            sorters.append(DateSorter(mode=mode))
+        elif mode == SortMode.ALPHA_NUM:
+            sorters.append(AlphaNumSorter())
+        else:
+            raise ValueError(f'invalid sort_mode: {mode}')
+
+        return MergedSorter(*sorters)
+
+    def show_warnings(self):
+        """ Show warnings when using obsoleted option. """
+        for w in self.warnings:
+            w()
+
+    def write_setting(self, section, key, value):
+        """
+        Write the key/value pair to the settngs file in the
+        section specified. The settings file is useful for recording
+        changes the user makes so that they can be remembered next time
+        the application starts.
+        """
+        cp = ConfigParser()
+        cp.read(self.settings_file)
+        if not cp.has_section(section):
+            cp.add_section(section)
+
+        cp.set(section, key, "%s" % value)
+        with open(self.settings_file, 'w') as configfile:
+            cp.write(configfile)
+
+        logging.debug("Wrote [%s] %s = %s to %s" % (section, key, value, self.settings_file))
+
+    def read_setting(self, section, key):
+        """
+        Read the key in the specified section from the settings file,
+        or returns None if not found.
+        """
+        cp = ConfigParser()
+        cp.read(self.settings_file)
+        if cp.has_section(section):
+            if cp.has_option(section, key):
+                return cp.get(section, key)
+        return None
 
         self.markdown_mode = cp.get(cfg_sec, 'markdown_mode')
 
@@ -245,6 +364,12 @@ class NotesListModel(SubjectMixin):
 class Controller:
     """Main application class.
     """
+    SORT_MODES = {
+        'title (alphabetical order)': SortMode.ALPHA,
+        'title (alphanumerical order)': SortMode.ALPHA_NUM,
+        'modification date': SortMode.MODIFICATION_DATE,
+        'creation date': SortMode.CREATION_DATE,
+    }
 
     def __init__(self, config):
         SubjectMixin.MAIN_THREAD = threading.current_thread()
@@ -262,7 +387,7 @@ class Controller:
 
         log_filename = os.path.join(self.config.db_path, 'nvpy.log')
         # file will get nuked when it reaches 100kB
-        lhandler = RotatingFileHandler(log_filename, maxBytes=100000, backupCount=1)
+        lhandler = RotatingFileHandler(log_filename, maxBytes=100000, backupCount=1, encoding='utf8')
         lhandler.setLevel(logging.DEBUG)
         lhandler.setFormatter(logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(message)s'))
         # we get the root logger and configure it
@@ -273,7 +398,8 @@ class Controller:
         # this will go to the root logger
         logging.debug('nvpy logging initialized')
 
-        logging.debug('config read from %s' % (str(self.config.files_read),))
+        logging.debug('config read from %s' % (str(self.config.files_read), ))
+        self.config.show_warnings()
 
         if self.config.sn_username == '':
             self.config.simplenote_sync = 0
@@ -282,8 +408,7 @@ class Controller:
         if rst_css:
             if rst_css.startswith("~/"):
                 # On Mac, paths that start with '~/' aren't found by path.exists
-                rst_css = rst_css.replace(
-                    "~", os.path.abspath(os.path.expanduser('~')), 1)
+                rst_css = rst_css.replace("~", os.path.abspath(os.path.expanduser('~')), 1)
                 self.config.rest_css_path = rst_css
             if not os.path.exists(rst_css):
                 # Couldn't find the user-defined css file. Use docutils css instead.
@@ -292,85 +417,90 @@ class Controller:
         if md_css:
             if md_css.startswith("~/"):
                 # On Mac, paths that start with '~/' aren't found by path.exists
-                md_css = md_css.replace(
-                    "~", os.path.abspath(os.path.expanduser('~')), 1)
+                md_css = md_css.replace("~", os.path.abspath(os.path.expanduser('~')), 1)
                 self.config.md_css_path = md_css
             if not os.path.exists(md_css):
                 # Couldn't find the user-defined css file.
                 # Do not use css styling for markdown.
                 self.config.md_css_path = None
 
-
         self.notes_list_model = NotesListModel()
         # create the interface
-        self.view = view.View(self.config, self.notes_list_model)
+        self.view = view.View(self.config, self.notes_list_model, sort_modes=tuple(self.SORT_MODES.keys()))
 
-        # read our database of notes into memory
-        # and sync with simplenote.
         try:
-            self.notes_db = NotesDB(self.config)
+            # read our database of notes into memory
+            # and sync with simplenote.
+            try:
+                self.notes_db = NotesDB(self.config)
+            except ReadError as e:
+                emsg = "Please check nvpy.log.\n" + str(e)
+                self.view.show_error('Sync error', emsg)
+                exit(1)
 
-        except ReadError, e:
-            emsg = "Please check nvpy.log.\n" + str(e)
-            self.view.show_error('Sync error', emsg)
-            exit(1)
+            self.notes_db.add_observer('saved:note', self.observer_notes_db_saved_note)
+            self.notes_db.add_observer('synced:note', self.observer_notes_db_synced_note)
+            self.notes_db.add_observer('change:note-status', self.observer_notes_db_change_note_status)
 
-        self.notes_db.add_observer('synced:note', self.observer_notes_db_synced_note)
-        self.notes_db.add_observer('change:note-status', self.observer_notes_db_change_note_status)
+            if self.config.simplenote_sync:
+                self.notes_db.add_observer('progress:sync_full', self.observer_notes_db_sync_full)
+                self.notes_db.add_observer('error:sync_full', self.observer_notes_db_error_sync_full)
+                self.notes_db.add_observer('complete:sync_full', self.observer_notes_db_complete_sync_full)
 
-        if self.config.simplenote_sync:
-            self.notes_db.add_observer('progress:sync_full', self.observer_notes_db_sync_full)
-            self.notes_db.add_observer('error:sync_full', self.observer_notes_db_error_sync_full)
-            self.notes_db.add_observer('complete:sync_full', self.observer_notes_db_complete_sync_full)
+            # we want to be notified when the user does stuff
+            self.view.add_observer('click:notelink', self.observer_view_click_notelink)
+            self.view.add_observer('delete:note', self.observer_view_delete_note)
+            self.view.add_observer('select:note', self.observer_view_select_note)
+            self.view.add_observer('change:entry', self.observer_view_change_entry)
+            self.view.add_observer('change:text', self.observer_view_change_text)
+            self.view.add_observer('change:pinned', self.observer_view_change_pinned)
+            self.view.add_observer('change:markdown', self.observer_view_change_markdown)
+            self.view.add_observer('create:note', self.observer_view_create_note)
+            self.view.add_observer('keep:house', self.observer_view_keep_house)
+            self.view.add_observer('command:markdown', self.observer_view_markdown)
+            self.view.add_observer('command:rest', self.observer_view_rest)
+            self.view.add_observer('delete:tag', self.observer_view_delete_tag)
+            self.view.add_observer('add:tag', self.observer_view_add_tag)
+            self.view.add_observer('change:sort_mode', self.observer_view_change_sort_mode)
+            self.view.add_observer('change:pinned_on_top', self.observer_view_change_pinned_on_top)
 
-        # we want to be notified when the user does stuff
-        self.view.add_observer('click:notelink',
-                self.observer_view_click_notelink)
-        self.view.add_observer('delete:note', self.observer_view_delete_note)
-        self.view.add_observer('select:note', self.observer_view_select_note)
-        self.view.add_observer('change:entry', self.observer_view_change_entry)
-        self.view.add_observer('change:text', self.observer_view_change_text)
-        self.view.add_observer('change:pinned', self.observer_view_change_pinned)
-        self.view.add_observer('change:markdown', self.observer_view_change_markdown)
-        self.view.add_observer('create:note', self.observer_view_create_note)
-        self.view.add_observer('keep:house', self.observer_view_keep_house)
-        self.view.add_observer('command:markdown', self.observer_view_markdown)
-        self.view.add_observer('command:rest', self.observer_view_rest)
-        self.view.add_observer('delete:tag', self.observer_view_delete_tag)
-        self.view.add_observer('add:tag', self.observer_view_add_tag)
+            if self.config.simplenote_sync:
+                self.view.add_observer('command:sync_full', lambda v, et, e: self.sync_full())
+                self.view.add_observer('command:sync_current_note', self.observer_view_sync_current_note)
 
-        if self.config.simplenote_sync:
-            self.view.add_observer('command:sync_full', lambda v, et, e: self.sync_full())
-            self.view.add_observer('command:sync_current_note', self.observer_view_sync_current_note)
+            self.view.add_observer('close', self.observer_view_close)
 
-        self.view.add_observer('close', self.observer_view_close)
+            # setup UI to reflect our search mode and case sensitivity
+            self.view.set_cs(self.config.case_sensitive, silent=True)
+            self.view.set_search_mode(self.config.search_mode, silent=True)
 
-        # setup UI to reflect our search mode and case sensitivity
-        self.view.set_cs(self.config.case_sensitive, silent=True)
-        self.view.set_search_mode(self.config.search_mode, silent=True)
+            self.view.add_observer('change:cs', self.observer_view_change_cs)
+            self.view.add_observer('change:search_mode', self.observer_view_change_search_mode)
 
-        self.view.add_observer('change:cs', self.observer_view_change_cs)
-        self.view.add_observer('change:search_mode', self.observer_view_change_search_mode)
+            # nn is a list of (key, note) objects
+            nn, match_regexp, active_notes = self.notes_db.filter_notes()
+            # this will trigger the list_change event
+            self.notes_list_model.set_list(nn)
+            self.notes_list_model.match_regexp = match_regexp
+            self.view.set_note_tally(len(nn), active_notes, len(self.notes_db.notes))
 
-        # nn is a list of (key, note) objects
-        nn, match_regexp, active_notes = self.notes_db.filter_notes()
-        # this will trigger the list_change event
-        self.notes_list_model.set_list(nn)
-        self.notes_list_model.match_regexp = match_regexp
-        self.view.set_note_tally(len(nn), active_notes, len(self.notes_db.notes))
+            # we'll use this to keep track of the currently selected note
+            # we only use idx, because key could change from right under us.
+            self.selected_note_key = None
+            self.view.select_note(0)
 
-        # we'll use this to keep track of the currently selected note
-        # we only use idx, because key could change from right under us.
-        self.selected_note_key = None
-        self.view.select_note(0)
-
-        if self.config.background_full_sync:
-            self.view.after(0, self.sync_full)
+            if self.config.simplenote_sync:
+                self.view.after(0, self.sync_full)
+        except BaseException:
+            # Initialization failed.  Stop all timers.
+            self.view.cancel_timers()
+            raise
 
     def main_loop(self):
         if not self.config.files_read:
-            self.view.show_warning('No config file',
-                                  'Could not read any configuration files. See https://github.com/cpbotha/nvpy for details.')
+            self.view.show_warning(
+                'No config file',
+                'Could not read any configuration files. See https://github.com/cpbotha/nvpy for details.')
 
         elif not self.config.ok:
             wmsg = ('Please rename [default] to [nvpy] in %s. ' + \
@@ -383,14 +513,18 @@ class Controller:
             self.notes_db.handle_notifies()
 
         self.view.after(0, poll_notifies)
-        self.view.main_loop()
+        try:
+            self.view.main_loop()
+        finally:
+            # Cancel all timers before stop this program.
+            self.view.cancel_timers()
 
-    def observer_notes_db_change_note_status(self, notes_db, evt_type, evt):
+    def observer_notes_db_change_note_status(self, notes_db, evt_type, evt: events.NoteStatusChangedEvent):
         skey = self.selected_note_key
         if skey == evt.key:
             self.view.set_note_status(self.notes_db.get_note_status(skey))
 
-    def observer_notes_db_sync_full(self, notes_db, evt_type, evt):
+    def observer_notes_db_sync_full(self, notes_db, evt_type, evt: events.SyncProgressEvent):
         logging.debug(evt.msg)
         self.view.set_status_text(evt.msg)
 
@@ -402,16 +536,16 @@ class Controller:
         # change status to "Full syncing"
         self.update_note_status()
 
-    def observer_notes_db_error_sync_full(self, notes_db, evt_type, evt):
+    def observer_notes_db_error_sync_full(self, notes_db, evt_type, evt: events.SyncFailedEvent):
         try:
             raise evt.error
-        except SyncError, e:
+        except (SyncError, HTTPException) as e:
             self.view.show_error('Sync error', e)
-        except WriteError, e:
+        except WriteError as e:
             emsg = "Please check nvpy.log.\n" + str(e)
             self.view.show_error('Sync error', emsg)
             exit(1)
-        except Exception, e:
+        except Exception as e:
             crash_log = ''.join(traceback.format_exception(*evt.exc_info))
             logging.error(crash_log)
             emsg = 'An unexpected error has occurred.\n'\
@@ -423,15 +557,20 @@ class Controller:
         # return normal status from "Full syning".
         self.update_note_status()
 
-    def observer_notes_db_complete_sync_full(self, notes_db, evt_type, evt):
+    def observer_notes_db_complete_sync_full(self, notes_db, evt_type, evt: events.SyncCompletedEvent):
         sync_from_server_errors = evt.errors
         if sync_from_server_errors > 0:
-            self.view.show_error('Error syncing notes from server', 'Error syncing %d notes from server. Please check nvpy.log for details.' % (sync_from_server_errors,))
+            self.view.show_error(
+                'Error syncing notes from server',
+                'Error syncing %d notes from server. Please check nvpy.log for details.' % (sync_from_server_errors, ))
 
         # return normal status from "Full syning".
         self.update_note_status()
 
-    def observer_notes_db_synced_note(self, notes_db, evt_type, evt):
+    def observer_notes_db_saved_note(self, notes_db, evt_type, evt: events.NoteSavedEvent):
+        self.view.refresh_notes_list()
+
+    def observer_notes_db_synced_note(self, notes_db, evt_type, evt: events.NoteSyncedEvent):
         """This observer gets called only when a note returns from
         a sync that's more recent than our most recent mod to that note.
         """
@@ -448,7 +587,7 @@ class Controller:
                 self.view.unmute_note_data_changes()
         self.view.refresh_notes_list()
 
-    def observer_view_click_notelink(self, view, evt_type, note_name):
+    def observer_view_click_notelink(self, view, evt_type, note_name: str):
         # find note_name in titles, try to jump to that note
         # if not in current list, change search string in case
         # it's somewhere else
@@ -461,7 +600,7 @@ class Controller:
             # to be a new regular expression to search for in the notes db.
             self.view.set_search_entry_text(note_name)
 
-    def observer_view_delete_note(self, view, evt_type, evt):
+    def observer_view_delete_note(self, view, evt_type, evt: events.NoteSelectionChangedEvent):
         # delete note from notes_db
         # remove the note from the notes_list_model.list
 
@@ -470,25 +609,23 @@ class Controller:
 
         # then try to select after the one that is to be deleted
         nidx = evt.sel + 1
-        if nidx >= 0 and nidx < self.view.get_number_of_notes():
+        if 0 <= nidx < self.view.get_number_of_notes():
             self.view.select_note(nidx)
 
         # finally delete the note
         self.notes_db.delete_note(key)
 
-        # easiest now is just to regenerate the list by resetting search string
-        # if the note after the deleted one is already selected, this will
-        # simply keep that selection!
-        self.view.set_search_entry_text(self.view.get_search_entry_text())
+        # and refresh the window.
+        self.view.refresh_notes_list()
 
     def helper_markdown_to_html(self):
         if self.selected_note_key:
             key = self.selected_note_key
             c = self.notes_db.get_note_content(key)
-            logging.debug("Trying to convert %s to html." % (key,))
+            logging.debug("Trying to convert %s to html." % (key, ))
             if HAVE_MARKDOWN:
-                logging.debug("Convert note %s to html." % (key,))
-                exts = re.split("\\s", self.config.md_extensions.strip()) if self.config.md_extensions else []
+                logging.debug("Convert note %s to html." % (key, ))
+                exts = re.split('\s+', self.config.md_extensions.strip()) if self.config.md_extensions else []
                 exts += list(DEFAULT_MARKDOWN_EXTS)
                 # remove duplicate items on exts.
                 exts = list(set(exts))
@@ -496,8 +633,8 @@ class Controller:
                 html = markdown.markdown(c, extensions=exts)
                 logging.debug("Convert done.")
                 if self.config.md_css_path:
-                    css = u"""<link rel="stylesheet" href="%s">""" % (self.config.md_css_path,)
-                    html = u"""<div class="markdown-body">%s</div>""" % (html,)
+                    css = u"""<link rel="stylesheet" href="%s">""" % (self.config.md_css_path, )
+                    html = u"""<div class="markdown-body">%s</div>""" % (html, )
                 else:
                     css = u""""""
 
@@ -520,9 +657,11 @@ class Controller:
 %s
 </body>
 </html>
-            """ % ('<meta http-equiv="refresh" content="5">' if self.view.get_continuous_rendering() else "",
-                   css if self.config.md_css_path else "",
-                   html,)
+            """ % (
+                '<meta http-equiv="refresh" content="5">' if self.view.get_continuous_rendering() else "",
+                css if self.config.md_css_path else "",
+                html,
+            )
             f.write(s)
             f.close()
             return fn
@@ -536,8 +675,7 @@ class Controller:
                 if self.config.rest_css_path:
                     settings['stylesheet_path'] = self.config.rest_css_path
                 # this gives the whole document
-                html = docutils.core.publish_string(
-                    c, writer_name='html', settings_overrides=settings)
+                html = docutils.core.publish_string(c, writer_name='html', settings_overrides=settings)
                 # publish_parts("*anurag*",writer_name='html')['body']
                 # gives just the desired part of the tree
 
@@ -554,7 +692,7 @@ class Controller:
             # "'ascii' codec can't decode byte" error
             s = u"""
 %s
-            """ % (unicode(html, 'utf8'),)
+            """ % (unicode(html, 'utf8'), )
 
             f.write(s)
             f.close()
@@ -585,8 +723,8 @@ class Controller:
         else:
             syncn = wfsn = 0
 
-        savet = 'Saving %d notes.' % (saven,) if saven > 0 else ''
-        synct = 'Waiting to sync %d notes.' % (syncn,) if syncn > 0 else ''
+        savet = 'Saving %d notes.' % (saven, ) if saven > 0 else ''
+        synct = 'Waiting to sync %d notes.' % (syncn, ) if syncn > 0 else ''
         wfsnt = 'Syncing with simplenote server.' if wfsn else ''
 
         return ' '.join([i for i in [savet, synct, wfsnt] if i])
@@ -608,7 +746,7 @@ class Controller:
         if self.view.get_continuous_rendering():
             self.helper_markdown_to_html()
 
-    def observer_view_select_note(self, view, evt_type, evt):
+    def observer_view_select_note(self, view, evt_type, evt: events.NoteSelectionChangedEvent):
         self.select_note(evt.sel)
 
     def observer_view_sync_current_note(self, view, evt_type, evt):
@@ -617,32 +755,28 @@ class Controller:
             # this call will update our in-memory version if necessary
             ret = self.notes_db.sync_note_unthreaded(key)
             if ret and ret[1] == True:
-                self.view.update_selected_note_data(
-                        self.notes_db.notes[key])
-                self.view.set_status_text(
-                'Synced updated note from server.')
+                self.view.update_selected_note_data(self.notes_db.notes[key])
+                self.view.set_status_text('Synced updated note from server.')
 
-            elif ret[1] == False:
-                self.view.set_status_text(
-                        'Server had nothing newer for this note.')
+            elif ret and ret[1] == False:
+                self.view.set_status_text('Server had nothing newer for this note.')
 
             elif ret is None:
-                self.view.set_status_text(
-                        'Unable to sync with server. Offline?')
+                self.view.set_status_text('Unable to sync with server. Offline?')
 
-    def observer_view_change_cs(self, view, evt_type, evt):
+    def observer_view_change_cs(self, view, evt_type, evt: events.CheckboxChangedEvent):
         # evt.value is the new value
         # only do something if user has really toggled
         if evt.value != self.config.case_sensitive:
             self.config.case_sensitive = evt.value
             self.view.refresh_notes_list()
 
-    def observer_view_change_search_mode(self, view, evt_type, evt):
+    def observer_view_change_search_mode(self, view, evt_type, evt: events.CheckboxChangedEvent):
         if evt.value != self.config.search_mode:
             self.config.search_mode = evt.value
             self.view.refresh_notes_list()
 
-    def observer_view_change_entry(self, view, evt_type, evt):
+    def observer_view_change_entry(self, view, evt_type, evt: events.TextBoxChangedEvent):
         # store the currently selected note key
         k = self.selected_note_key
         # for each new evt.value coming in, get a new list from the notes_db
@@ -676,7 +810,7 @@ class Controller:
             # currently being displayed. this could happen if a sync gets
             # a new note of the server to replace the currently displayed one.
             if self.view.is_note_different(new_note):
-                logging.debug("Currently selected note %s replaced by newer from server." % (k,))
+                logging.debug("Currently selected note %s replaced by newer from server." % (k, ))
                 # carefully update currently selected note
                 # restore cursor position, search and link highlights
                 self.view.update_selected_note_data(new_note)
@@ -699,23 +833,32 @@ class Controller:
             self.notes_db.set_note_tags(self.selected_note_key, evt.value)
             self.view.cmd_notes_list_select()
 
-    def observer_view_delete_tag(self, view, evt_type, evt):
+    def observer_view_delete_tag(self, view, evt_type, evt: events.TagRemovedEvent):
         self.notes_db.delete_note_tag(self.selected_note_key, evt.tag)
         self.view.cmd_notes_list_select()
 
-    def observer_view_add_tag(self, view, evt_type, evt):
+    def observer_view_add_tag(self, view, evt_type, evt: events.TagsAddedEvent):
         self.notes_db.add_note_tags(self.selected_note_key, evt.tags)
         self.view.cmd_notes_list_select()
         self.view.tags_entry_var.set('')
 
-    def observer_view_change_pinned(self, view, evt_type, evt):
+    def observer_view_change_pinned(self, view, evt_type, evt: events.CheckboxChangedEvent):
         # get new text and update our database
         if self.selected_note_key:
             self.notes_db.set_note_pinned(self.selected_note_key, evt.value)
-    
+
     def observer_view_change_markdown(self, view, evt_type, evt):
-		if self.selected_note_key:
-			self.notes_db.set_note_markdown(self.selected_note_key, evt.value)
+        if self.selected_note_key:
+            self.notes_db.set_note_markdown(self.selected_note_key, evt.value)
+
+    def observer_view_change_sort_mode(self, view, evt_type, evt: events.SortModeChangedEvent):
+        self.config.sort_mode = self.SORT_MODES[evt.mode].value
+        # Refresh notes list.
+        self.view.refresh_notes_list()
+
+    def observer_view_change_pinned_on_top(self, view, evt_type, evt: events.PinnedOnTopChangedEvent):
+        self.config.pinned_ontop = evt.pinned_on_top
+        self.view.refresh_notes_list()
 
     def observer_view_close(self, view, evt_type, evt):
         # check that everything has been saved and synced before exiting
@@ -748,7 +891,7 @@ class Controller:
 
             self.view.close()
 
-    def observer_view_create_note(self, view, evt_type, evt):
+    def observer_view_create_note(self, view, evt_type, evt: events.NoteCreatedEvent):
         # create the note
         new_key = self.notes_db.create_note(evt.title)
         # clear the search entry, this should trigger a new list being returned
@@ -796,20 +939,32 @@ class Controller:
         self.view.unmute_note_data_changes()
 
     def sync_full(self):
-        if self.config.background_full_sync:
-            self.notes_db.sync_full_threaded()
-        else:
-            self.notes_db.sync_full_unthreaded()
+        self.notes_db.sync_full_threaded()
 
     def update_note_status(self):
         skey = self.selected_note_key
         self.view.set_note_status(self.notes_db.get_note_status(skey))
 
 
-def main():
+def get_appdir():
     # setup appdir
     if hasattr(sys, 'frozen') and sys.frozen:
-        appdir, _ = os.path.split(sys.executable)
+        if hasattr(sys, '_MEIPASS'):
+            # PyInstaller
+            appdir = sys._MEIPASS
+
+            # WORKAROUND: Bug that always raise the SSLCertVerificationError from urlopen()
+            #             when CPython is not installed.
+
+            # Use certificate from certifi only if cafile could not find by ssl.
+            # See https://github.com/pyinstaller/pyinstaller/pull/3952
+            import ssl
+            if ssl.get_default_verify_paths().cafile is None:
+                import certifi
+                os.environ['SSL_CERT_FILE'] = certifi.core.where()
+        else:
+            # py2exe
+            appdir, _ = os.path.split(sys.executable)
 
     else:
         dirname, _ = os.path.split(os.path.realpath(__file__))
@@ -820,11 +975,35 @@ def main():
 
     # make sure it's the full path
     appdir_full_path = os.path.abspath(appdir)
+    return appdir_full_path
 
-    config = Config(appdir_full_path)
 
-    controller = Controller(config)
-    controller.main_loop()
+def parse_cmd_line_args(args: typing.Optional[typing.List] = None) -> argparse.Namespace:
+    """ Parse command line arguments
+
+    Args:
+        args: List of command line arguments. If args is not specified, takes args from sys.args.
+
+    Returns:
+        A namespace object generated by argparse.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cfg', '-c', dest='cfg', metavar='nvpy.cfg', help='path to config file')
+    return parser.parse_args(args)
+
+
+def main(args: typing.Optional[typing.List] = None):
+    ns = parse_cmd_line_args(args)
+    config = Config(get_appdir(), ns.cfg)
+
+    try:
+        controller = Controller(config)
+        controller.main_loop()
+    except tk.Ucs4NotSupportedError as e:
+        logging.error(str(e))
+        import tkMessageBox  # type:ignore
+        tkMessageBox.showerror('UCS-4 not supported', str(e))
+        raise
 
 
 if __name__ == '__main__':

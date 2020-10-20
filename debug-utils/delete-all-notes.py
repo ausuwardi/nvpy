@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 # Usage:
-#   ./update-note-to-server.py file.json
+#   ./delete-all-notes.py
 
-import json
 import os
-import sys
 from configparser import ConfigParser
 
 import simplenote
-
-file_name = sys.argv[1]
-new_note = json.loads(open(file_name).read())
 
 home = os.path.abspath(os.path.expanduser('~'))
 cfg_files = [
@@ -27,8 +22,14 @@ user = cp.get('nvpy', 'sn_username', raw=True)
 passwd = cp.get('nvpy', 'sn_password', raw=True)
 
 sn = simplenote.Simplenote(user, passwd)
-note, status = sn.update_note(new_note)
+notes, status = sn.get_note_list(data=False)
 if status == 0:
-    print(json.dumps(note))
+    for note in notes:
+        print('delete', note['key'])
+        res, status = sn.delete_note(note['key'])
+        if status == 0:
+            pass
+        else:
+            print(str(res))
 else:
-    print(str(note))
+    print(str(notes))

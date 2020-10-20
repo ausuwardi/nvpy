@@ -1,14 +1,17 @@
 # nvPY: cross-platform note-taking app with simplenote syncing
 # copyright 2012 by Charl P. Botha <cpbotha@vxlabs.com>
 # new BSD license
-
 import datetime
 import random
 import re
-import string
-import urllib2
+from urllib.error import URLError
+from urllib.request import urlopen
+from queue import Queue, Empty as QueueEmpty
+from .p3port import unicode
+
 import threading
-from Queue import Queue, Empty as QueueEmpty
+
+from . import tk
 
 # first line with non-whitespace should be the title
 note_title_re = re.compile('\s*(.*)\n?')
@@ -20,7 +23,7 @@ def generate_random_key():
 
     stackoverflow question 2782229
     """
-    return '%030x' % (random.randrange(256 ** 15),)
+    return '%030x' % (random.randrange(256**15), )
 
 
 def get_note_title(note):
@@ -36,11 +39,12 @@ def get_note_title(note):
     return title
 
 
-def get_note_title_file(note):
+def get_note_title_file(note, replace_filename_spaces):
     mo = note_title_re.match(note.get('content', ''))
     if mo:
         fn = mo.groups()[0]
-        fn = fn.replace(' ', '_')
+        if replace_filename_spaces:
+            fn = fn.replace(' ', '_')
         fn = fn.replace('/', '_')
         if not fn:
             return ''
@@ -139,55 +143,19 @@ def sanitise_tags(tags):
         return illegals_removed.split(',')
 
 
-def sort_by_title_pinned(a, b):
-    if note_pinned(a.note) and not note_pinned(b.note):
-        return -1
-    elif not note_pinned(a.note) and note_pinned(b.note):
-        return 1
-    else:
-        return cmp(get_note_title(a.note), get_note_title(b.note))
-
-
-def sort_by_modify_date_pinned(a, b):
-    if note_pinned(a.note) and not note_pinned(b.note):
-        return 1
-    elif not note_pinned(a.note) and note_pinned(b.note):
-        return -1
-    else:
-        return cmp(float(a.note.get('modifydate', 0)), float(b.note.get('modifydate', 0)))
-
-
-def sort_by_create_date_pinned(a, b):
-    if note_pinned(a.note) and not note_pinned(b.note):
-        return 1
-    elif not note_pinned(a.note) and note_pinned(b.note):
-        return -1
-    else:
-        return cmp(float(a.note.get('createdate', 0)), float(b.note.get('createdate', 0)))
-
 def check_internet_on():
     """Utility method to check if we have an internet connection.
 
     slightly adapted from: http://stackoverflow.com/a/3764660/532513
     """
     try:
-        urllib2.urlopen('http://74.125.228.100', timeout=1)
+        urlopen('http://74.125.228.100', timeout=1)
         return True
 
-    except urllib2.URLError:
+    except URLError:
         pass
 
     return False
-
-
-class KeyValueObject:
-    """Store key=value pairs in this object and retrieve with o.key.
-
-    You should also be able to do MiscObject(**your_dict) for the same effect.
-    """
-
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
 
 
 class SubjectMixin:
@@ -195,6 +163,11 @@ class SubjectMixin:
 
     We follow the convention action:object, e.g. change:entry.
     """
+
+    # main thread object
+    #
+    # Workaround for missing the threading.main_thread() function on Python 2.7.
+    # This variable was updated by the Controller.__init__().
     MAIN_THREAD = None
 
     def __init__(self):
@@ -204,6 +177,7 @@ class SubjectMixin:
 
     def add_observer(self, evt_type, o):
         from .debug import wrap_buggy_function
+        o = tk.with_ucs4_error_handling(o)
         o = wrap_buggy_function(o)
 
         if evt_type not in self.observers:
@@ -218,8 +192,7 @@ class SubjectMixin:
 
         if threading.current_thread() == self.MAIN_THREAD:
             for o in self.observers[evt_type]:
-                # invoke observers with ourselves as first param
-                o(self, evt_type, evt)
+                self.__invoke_observer(o, evt_type, evt)
 
         else:
             # Tkinter is not thread safe. so, observers must be executed on MAIN_THREAD.
@@ -236,11 +209,14 @@ class SubjectMixin:
                 evt_type, evt = self.notifies.get_nowait()
 
                 for o in self.observers[evt_type]:
-                    # invoke observers with ourselves as first param
-                    o(self, evt_type, evt)
+                    self.__invoke_observer(o, evt_type, evt)
 
         except QueueEmpty:
             pass
+
+    def __invoke_observer(self, observer, event_type, event):
+        # invoke observers with ourselves as first param
+        observer(self, event_type, event)
 
     def mute(self, evt_type):
         self.mutes[evt_type] = True
